@@ -963,7 +963,7 @@ void ObjectFile<E>::claim_unresolved_symbols(Context<E> &ctx) {
 
     // Convert remaining undefined symbols to absolute symbols with value 0.
     if (ctx.arg.unresolved_symbols != UNRESOLVED_ERROR ||
-        esym.is_undef_weak()) {
+        ctx.arg.noinhibit_exec || esym.is_undef_weak()) {
       claim();
       sym.ver_idx = ctx.default_version;
       sym.is_imported = false;
@@ -1397,6 +1397,7 @@ void SharedFile<E>::write_symtab(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf

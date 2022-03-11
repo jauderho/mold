@@ -344,12 +344,10 @@ void RelDynSection<E>::update_shdr(Context<E> &ctx) {
 
 template <typename E>
 static ElfRel<E> reloc(u64 offset, u32 type, u32 sym, i64 addend = 0) {
-  return {offset, type, sym, addend};
-}
-
-template <>
-ElfRel<I386> reloc<I386>(u64 offset, u32 type, u32 sym, i64 addend) {
-  return {(u32)offset, type, sym};
+  if constexpr (E::e_machine == EM_386 || E::e_machine == EM_ARM)
+    return {(u32)offset, type, sym};
+  else
+    return {offset, type, sym, addend};
 }
 
 template <typename E>
@@ -373,9 +371,9 @@ void RelDynSection<E>::sort(Context<E> &ctx) {
 
   auto get_rank = [](u32 r_type) {
     switch (r_type) {
-    case E::R_IRELATIVE: return 0;
-    case E::R_RELATIVE: return 1;
-    default: return 2;
+    case E::R_RELATIVE: return 0;
+    case E::R_IRELATIVE: return 2;
+    default: return 1;
     }
   };
 
@@ -2220,6 +2218,7 @@ void RelocSection<E>::copy_buf(Context<E> &ctx) {
 INSTANTIATE(X86_64);
 INSTANTIATE(I386);
 INSTANTIATE(ARM64);
+INSTANTIATE(ARM32);
 INSTANTIATE(RISCV64);
 
 } // namespace mold::elf
