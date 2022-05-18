@@ -1,6 +1,7 @@
 #include "mold.h"
 #include "../archive-file.h"
 #include "../cmdline.h"
+#include "../output-file.h"
 
 #include <cstdlib>
 #include <fcntl.h>
@@ -18,6 +19,41 @@ split_string(std::string_view str, char sep) {
   if (pos == str.npos)
     return {str, ""};
   return {str.substr(0, pos), str.substr(pos + 1)};
+}
+
+template <typename E>
+static bool has_lto_obj(Context<E> &ctx) {
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->lto_module)
+      return true;
+  return false;
+}
+
+template <typename E>
+static void resolve_symbols(Context<E> &ctx) {
+  std::vector<InputFile<E> *> files;
+  append(files, ctx.objs);
+  append(files, ctx.dylibs);
+
+  for (InputFile<E> *file : files)
+    file->resolve_symbols(ctx);
+
+  std::vector<ObjectFile<E> *> live_objs;
+  for (ObjectFile<E> *file : ctx.objs)
+    if (file->is_alive)
+      live_objs.push_back(file);
+
+  for (i64 i = 0; i < live_objs.size(); i++) {
+    live_objs[i]->mark_live_objects(ctx, [&](ObjectFile<E> *file) {
+      live_objs.push_back(file);
+    });
+  }
+
+  for (InputFile<E> *file : files)
+    file->resolve_symbols(ctx);
+
+  if (has_lto_obj(ctx))
+    do_lto(ctx);
 }
 
 template <typename E>
@@ -66,19 +102,14 @@ static bool compare_segments(const std::unique_ptr<OutputSegment<E>> &a,
       return 1;
     if (name == "__DATA")
       return 2;
-    return INT_MAX;
+    if (name == "__LINKEDIT")
+      return 4;
+    return 3;
   };
 
-  std::string_view na = a->cmd.get_segname();
-  std::string_view nb = b->cmd.get_segname();
-  i64 ra = get_rank(na);
-  i64 rb = get_rank(nb);
-  if (ra != INT_MAX || rb != INT_MAX)
-    return ra < rb;
-
-  if (na == "__LINKEDIT" || nb == "__LINKEDIT")
-    return na != "__LINKEDIT";
-  return na < nb;
+  std::string_view x = a->cmd.get_segname();
+  std::string_view y = b->cmd.get_segname();
+  return std::tuple{get_rank(x), x} < std::tuple{get_rank(y), y};
 }
 
 template <typename E>
@@ -122,20 +153,47 @@ static bool compare_chunks(const Chunk<E> *a, const Chunk<E> *b) {
     "__code_signature",
   };
 
-  auto get_rank = [](const Chunk<E> *chunk) -> i64 {
-    std::string_view name = chunk->hdr.get_sectname();
+  auto get_rank = [](std::string_view name) {
     i64 i = 0;
     for (; i < sizeof(rank) / sizeof(rank[0]); i++)
       if (name == rank[i])
         return i;
-    return INT_MAX;
+    return i;
   };
 
-  i64 ra = get_rank(a);
-  i64 rb = get_rank(b);
-  if (ra == INT_MAX && rb == INT_MAX)
-    return a->hdr.get_sectname() < b->hdr.get_sectname();
-  return ra < rb;
+  std::string_view x = a->hdr.get_sectname();
+  std::string_view y = b->hdr.get_sectname();
+  return std::tuple{get_rank(x), x} < std::tuple{get_rank(y), y};
+}
+
+template <typename E>
+static void claim_unresolved_symbols(Context<E> &ctx) {
+  for (std::string_view name : ctx.arg.U)
+    if (Symbol<E> *sym = get_symbol(ctx, name); !sym->file)
+      sym->is_imported = true;
+
+  for (ObjectFile<E> *file : ctx.objs) {
+    for (i64 i = 0; i < file->mach_syms.size(); i++) {
+      MachSym &msym = file->mach_syms[i];
+      if (!msym.ext || !msym.is_undef())
+        continue;
+
+      Symbol<E> &sym = *file->syms[i];
+      std::scoped_lock lock(sym.mu);
+
+      if (sym.is_imported) {
+        if (!sym.file ||
+            (!sym.file->is_dylib && file->priority < sym.file->priority)) {
+          sym.file = file;
+          sym.is_extern = true;
+          sym.is_imported = true;
+          sym.subsec = nullptr;
+          sym.value = 0;
+          sym.is_common = false;
+        }
+      }
+    }
+  }
 }
 
 template <typename E>
@@ -145,7 +203,7 @@ static void create_synthetic_chunks(Context<E> &ctx) {
       subsec->isec.osec.add_subsec(subsec.get());
 
   for (Chunk<E> *chunk : ctx.chunks) {
-    if (chunk != ctx.data && chunk->is_regular &&
+    if (chunk != ctx.data && chunk->is_output_section &&
         ((OutputSection<E> *)chunk)->members.empty())
       continue;
 
@@ -247,14 +305,25 @@ MappedFile<Context<E>> *find_framework(Context<E> &ctx, std::string name) {
 
 template <typename E>
 MappedFile<Context<E>> *find_library(Context<E> &ctx, std::string name) {
-  for (std::string dir : ctx.arg.library_paths) {
-    for (std::string ext : {".tbd", ".dylib", ".a"}) {
-      std::string path = dir + "/lib" + name + ext;
-      if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
-        return mf;
+  auto search = [&](std::vector<std::string> extn) -> MappedFile<Context<E>> * {
+    for (std::string dir : ctx.arg.library_paths) {
+      for (std::string e : extn) {
+        std::string path = dir + "/lib" + name + e;
+        if (MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path))
+          return mf;
+      }
     }
-  }
-  return nullptr;
+    return nullptr;
+  };
+
+  // -search_paths_first
+  if (ctx.arg.search_paths_first)
+    return search({".tbd", ".dylib", ".a"});
+
+  // -search_dylibs_first
+  if (MappedFile<Context<E>> *mf = search({".tbd", ".dylib"}))
+    return mf;
+  return search({".a"});
 }
 
 template <typename E>
@@ -271,8 +340,7 @@ strip_universal_header(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 }
 
 template <typename E>
-static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
-                      bool is_needed = false) {
+static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   if (get_file_type(mf) == FileType::MACH_UNIVERSAL)
     mf = strip_universal_header(ctx, mf);
 
@@ -280,10 +348,9 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
   case FileType::TAPI:
   case FileType::MACH_DYLIB:
     ctx.dylibs.push_back(DylibFile<E>::create(ctx, mf));
-    if (is_needed || !ctx.arg.dead_strip_dylibs)
-      ctx.dylibs.back()->is_needed = true;
     break;
   case FileType::MACH_OBJ:
+  case FileType::LLVM_BITCODE:
     ctx.objs.push_back(ObjectFile<E>::create(ctx, mf, ""));
     break;
   case FileType::AR:
@@ -292,8 +359,8 @@ static void read_file(Context<E> &ctx, MappedFile<Context<E>> *mf,
         ctx.objs.push_back(ObjectFile<E>::create(ctx, child, mf->name));
     break;
   default:
+    Fatal(ctx) << mf->name << ": unknown file type";
     break;
-    // Fatal(ctx) << mf->name << ": unknown file type";
   }
 }
 
@@ -325,29 +392,58 @@ read_filelist(Context<E> &ctx, std::string arg) {
 
 template <typename E>
 static void read_input_files(Context<E> &ctx, std::span<std::string> args) {
+  auto must_find_library = [&](std::string arg) {
+    MappedFile<Context<E>> *mf = find_library(ctx, arg);
+    if (!mf)
+      Fatal(ctx) << "library not found: -l" << arg;
+    return mf;
+  };
+
   while (!args.empty()) {
-    if (args[0].starts_with("-filelist")) {
-      for (std::string &path : read_filelist(ctx, args[1])) {
+    const std::string &arg = args[0];
+    args = args.subspan(1);
+
+    if (arg == "-all_load") {
+      ctx.all_load = true;
+    } else if (arg == "-noall_load") {
+      ctx.all_load = false;
+    } else if (arg == "-filelist") {
+      for (std::string &path : read_filelist(ctx, args[0])) {
         MappedFile<Context<E>> *mf = MappedFile<Context<E>>::open(ctx, path);
         if (!mf)
-          Fatal(ctx) << "-filepath " << args[1] << ": cannot open file: " << path;
+          Fatal(ctx) << "-filepath " << args[0] << ": cannot open file: " << path;
         read_file(ctx, mf);
       }
-      args = args.subspan(2);
-    } else if (args[0] == "-framework" || args[0] == "-needed_framework") {
-      bool needed = (args[0] == "-needed_framework");
-      read_file(ctx, find_framework(ctx, args[1]), needed);
-      args = args.subspan(2);
-    } else if (args[0] == "-l" || args[0] == "-needed-l") {
-      MappedFile<Context<E>> *mf = find_library(ctx, args[1]);
-      if (!mf)
-        Fatal(ctx) << "library not found: -l" << args[1];
-      bool needed = (args[0] == "-needed-l");
-      read_file(ctx, mf, needed);
-      args = args.subspan(2);
-    } else {
-      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, args[0]));
       args = args.subspan(1);
+    } else if (arg == "-force_load") {
+      bool orig = ctx.all_load;
+      ctx.all_load = true;
+      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, args[0]));
+      ctx.all_load = orig;
+      args = args.subspan(1);
+    } else if (arg == "-framework") {
+      read_file(ctx, find_framework(ctx, args[0]));
+      args = args.subspan(1);
+    } else if (arg == "-needed_framework") {
+      ctx.needed_l = true;
+      read_file(ctx, find_framework(ctx, args[0]));
+      ctx.needed_l = false;
+      args = args.subspan(1);
+    } else if (arg == "-l") {
+      read_file(ctx, must_find_library(args[0]));
+      args = args.subspan(1);
+    } else if (arg == "-needed-l") {
+      ctx.needed_l = true;
+      read_file(ctx, must_find_library(args[0]));
+      ctx.needed_l = false;
+      args = args.subspan(1);
+    } else if (arg == "-hidden-l") {
+      ctx.hidden_l = true;
+      read_file(ctx, must_find_library(args[0]));
+      ctx.hidden_l = false;
+      args = args.subspan(1);
+    } else {
+      read_file(ctx, MappedFile<Context<E>>::must_open(ctx, arg));
     }
   }
 
@@ -369,25 +465,31 @@ static int do_main(int argc, char **argv) {
   for (i64 i = 0; i < argc; i++)
     ctx.cmdline_args.push_back(argv[i]);
 
-  std::vector<std::string> file_args;
-  parse_nonpositional_args(ctx, file_args);
+  std::vector<std::string> file_args = parse_nonpositional_args(ctx);
 
   if (ctx.arg.arch != E::cputype) {
-    if (ctx.arg.arch == CPU_TYPE_X86_64)
+#if !defined(MOLD_DEBUG_X86_64_ONLY) && !defined(MOLD_DEBUG_ARM64_ONLY)
+    switch (ctx.arg.arch) {
+    case CPU_TYPE_X86_64:
       return do_main<X86_64>(argc, argv);
+    case CPU_TYPE_ARM64:
+      return do_main<X86_64>(argc, argv);
+    }
+#endif
+    Fatal(ctx) << "unknown cputype: " << ctx.arg.arch;
   }
 
   read_input_files(ctx, file_args);
 
-  i64 priority = 1;
   for (ObjectFile<E> *file : ctx.objs)
-    file->priority = priority++;
+    file->priority = ctx.file_priority++;
   for (DylibFile<E> *dylib : ctx.dylibs)
-    dylib->priority = priority++;
+    dylib->priority = ctx.file_priority++;
 
   for (i64 i = 0; i < ctx.dylibs.size(); i++)
     ctx.dylibs[i]->dylib_idx = i + 1;
 
+  // Parse input files
   for (ObjectFile<E> *file : ctx.objs)
     file->parse(ctx);
   for (DylibFile<E> *dylib : ctx.dylibs)
@@ -398,23 +500,7 @@ static int do_main(int argc, char **argv) {
       if (!file->archive_name.empty() && file->is_objc_object(ctx))
         file->is_alive = true;
 
-  for (ObjectFile<E> *file : ctx.objs) {
-    if (file->is_alive)
-      file->resolve_regular_symbols(ctx);
-    else
-      file->resolve_lazy_symbols(ctx);
-  }
-
-  std::vector<ObjectFile<E> *> live_objs;
-  for (ObjectFile<E> *file : ctx.objs)
-    if (file->is_alive)
-      live_objs.push_back(file);
-
-  for (i64 i = 0; i < live_objs.size(); i++)
-    append(live_objs, live_objs[i]->mark_live_objects(ctx));
-
-  for (DylibFile<E> *dylib : ctx.dylibs)
-    dylib->resolve_symbols(ctx);
+  resolve_symbols(ctx);
 
   if (ctx.output_type == MH_EXECUTE && !get_symbol(ctx, ctx.arg.entry)->file)
     Error(ctx) << "undefined entry point symbol: " << ctx.arg.entry;
@@ -433,6 +519,8 @@ static int do_main(int argc, char **argv) {
 
   for (ObjectFile<E> *file : ctx.objs)
     file->convert_common_symbols(ctx);
+
+  claim_unresolved_symbols(ctx);
 
   if (ctx.arg.dead_strip)
     dead_strip(ctx);
@@ -455,11 +543,16 @@ static int do_main(int argc, char **argv) {
     std::erase_if(ctx.dylibs, [](DylibFile<E> *file) { return !file->is_needed; });
 
   export_symbols(ctx);
+
   i64 output_size = assign_offsets(ctx);
   fix_synthetic_symbol_values(ctx);
 
-  ctx.output_file = OutputFile<E>::open(ctx, ctx.arg.output, output_size, 0777);
+  ctx.output_file =
+    OutputFile<Context<E>>::open(ctx, ctx.arg.output, output_size, 0777);
   ctx.buf = ctx.output_file->buf;
+
+  if (ctx.arg.uuid != UUID_NONE)
+    ctx.mach_hdr.write_uuid(ctx);
 
   for (std::unique_ptr<OutputSegment<E>> &seg : ctx.segments)
     seg->copy_buf(ctx);
@@ -483,7 +576,11 @@ Do not report bugs because it's too early to manage missing features as bugs.
 )";
   }
 
+#ifdef MOLD_DEBUG_X86_64_ONLY
+  return do_main<X86_64>(argc, argv);
+#else
   return do_main<ARM64>(argc, argv);
+#endif
 }
 
 }

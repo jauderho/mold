@@ -49,6 +49,7 @@ ElfShdr<E> *InputFile<E>::find_section(i64 type) {
 template <typename E>
 void InputFile<E>::clear_symbols() {
   for (Symbol<E> *sym : get_global_syms()) {
+    std::scoped_lock lock(sym->mu);
     if (sym->file == this) {
       sym->file = nullptr;
       sym->shndx = 0;
@@ -104,11 +105,11 @@ u32 ObjectFile<E>::read_note_gnu_property(Context<E> &ctx,
       continue;
 
     while (!desc.empty()) {
-      u32 type = *(u32 *)desc.data();
-      u32 size = *(u32 *)(desc.data() + 4);
+      u32 type = *(ul32 *)desc.data();
+      u32 size = *(ul32 *)(desc.data() + 4);
       desc = desc.substr(8);
       if (type == GNU_PROPERTY_X86_FEATURE_1_AND)
-        ret |= *(u32 *)desc.data();
+        ret |= *(ul32 *)desc.data();
       desc = desc.substr(align_to(size, E::word_size));
     }
   }
@@ -121,7 +122,7 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
   for (i64 i = 0; i < this->elf_sections.size(); i++) {
     const ElfShdr<E> &shdr = this->elf_sections[i];
 
-    if ((shdr.sh_flags & SHF_EXCLUDE) && !(shdr.sh_flags & SHF_ALLOC))
+    if ((shdr.sh_flags & SHF_EXCLUDE) && !(shdr.sh_flags & SHF_ALLOC) && shdr.sh_type != SHT_LLVM_ADDRSIG)
       continue;
 
     switch (shdr.sh_type) {
@@ -132,8 +133,13 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       const ElfSym<E> &sym = this->elf_syms[shdr.sh_info];
       std::string_view signature = symbol_strtab.data() + sym.st_name;
 
+      // Ignore a broken comdat group GCC emits for .debug_macros.
+      // https://github.com/rui314/mold/issues/438
+      if (signature.starts_with("wm4."))
+        continue;
+
       // Get comdat group members.
-      std::span<u32> entries = this->template get_data<u32>(ctx, shdr);
+      std::span<ul32> entries = this->template get_data<ul32>(ctx, shdr);
 
       if (entries.empty())
         Fatal(ctx) << *this << ": empty SHT_GROUP";
@@ -156,10 +162,28 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     case SHT_REL:
     case SHT_RELA:
     case SHT_NULL:
+    case SHT_ARM_ATTRIBUTES:
       break;
     default: {
       std::string_view name = this->shstrtab.data() + shdr.sh_name;
-      if (name == ".note.GNU-stack" || name.starts_with(".gnu.warning."))
+
+      // .note.GNU-stack section controls executable-ness of the stack
+      // area in GNU linkers. We ignore that section because silently
+      // making the stack area executable is too dangerous. Tell our
+      // users about the difference if that matters.
+      if (name == ".note.GNU-stack") {
+        if (shdr.sh_flags & SHF_EXECINSTR) {
+          if (!ctx.arg.z_execstack && !ctx.arg.z_execstack_if_needed)
+            Warn(ctx) << *this << ": this file may cause a segmentation"
+              " fault because it requires an executable stack. See"
+              " https://github.com/rui314/mold/tree/main/docs/execstack.md"
+              " for more info.";
+          needs_executable_stack = true;
+        }
+        continue;
+      }
+
+      if (name.starts_with(".gnu.warning."))
         continue;
 
       if (name == ".note.gnu.property") {
@@ -176,11 +200,53 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
       if (name == ".gnu.linkonce.d.DW.ref.__gxx_personality_v0")
         continue;
 
+      // Ignore debug sections if --strip-all or --strip-debug is given.
       if ((ctx.arg.strip_all || ctx.arg.strip_debug) &&
           is_debug_section(shdr, name))
         continue;
 
       this->sections[i] = std::make_unique<InputSection<E>>(ctx, *this, name, i);
+
+      // Save .llvm_addrsig for --icf=safe.
+      if (shdr.sh_type == SHT_LLVM_ADDRSIG) {
+        if (ctx.arg.icf && !ctx.arg.icf_all)
+          llvm_addrsig = this->sections[i].get();
+      }
+
+      // Save debug sections for --gdb-index.
+      if (ctx.arg.gdb_index) {
+        InputSection<E> *isec = this->sections[i].get();
+
+        if (name == ".debug_info")
+          debug_info = isec;
+        if (name == ".debug_ranges")
+          debug_ranges = isec;
+        if (name == ".debug_rnglists")
+          debug_rnglists = isec;
+
+        // If --gdb-index is given, contents of .debug_gnu_pubnames and
+        // .debug_gnu_pubtypes are copied to .gdb_index, so keeping them
+        // in an output file is just a waste of space.
+        if (name == ".debug_gnu_pubnames") {
+          debug_pubnames = isec;
+          isec->is_alive = false;
+        }
+
+        if (name == ".debug_gnu_pubtypes") {
+          debug_pubtypes = isec;
+          isec->is_alive = false;
+        }
+
+        // .debug_types is similar to .debug_info but contains type info
+        // only. It exists only in DWARF 4, has been removed in DWARF 5 and
+        // neither GCC nor Clang generate it by default
+        // (-fdebug-types-section is needed). As such there is probably
+        // little need to support it.
+        if (name == ".debug_types")
+          Fatal(ctx) << *this << ": mold's --gdb-index is not compatible"
+            " with .debug_types; to fix this error, remove"
+            " -fdebug-types-section and recompile";
+      }
 
       static Counter counter("regular_sections");
       counter++;
@@ -212,7 +278,6 @@ void ObjectFile<E>::initialize_ehframe_sections(Context<E> &ctx) {
     std::unique_ptr<InputSection<E>> &isec = sections[i];
     if (isec && isec->is_alive && isec->name() == ".eh_frame") {
       read_ehframe(ctx, *isec);
-      isec->is_ehframe = true;
       isec->is_alive = false;
     }
   }
@@ -258,13 +323,13 @@ void ObjectFile<E>::read_ehframe(Context<E> &ctx, InputSection<E> &isec) {
   i64 rel_idx = 0;
 
   for (std::string_view data = contents; !data.empty();) {
-    i64 size = *(u32 *)data.data();
+    i64 size = *(ul32 *)data.data();
     if (size == 0)
       break;
 
     i64 begin_offset = data.data() - contents.data();
     i64 end_offset = begin_offset + size + 4;
-    i64 id = *(u32 *)(data.data() + 4);
+    i64 id = *(ul32 *)(data.data() + 4);
     data = data.substr(size + 4);
 
     i64 rel_begin = rel_idx;
@@ -300,7 +365,7 @@ void ObjectFile<E>::read_ehframe(Context<E> &ctx, InputSection<E> &isec) {
   };
 
   for (i64 i = fdes_begin; i < fdes.size(); i++) {
-    i64 cie_offset = *(i32 *)(contents.data() + fdes[i].input_offset + 4);
+    i64 cie_offset = *(il32 *)(contents.data() + fdes[i].input_offset + 4);
     fdes[i].cie_idx = find_cie(fdes[i].input_offset + 4 - cie_offset);
   }
 
@@ -423,7 +488,7 @@ void ObjectFile<E>::initialize_symbols(Context<E> &ctx) {
 // We expect them to be sorted, so sort them if necessary.
 template <typename E>
 void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
-  if (E::e_machine != EM_RISCV)
+  if (!std::is_same_v<E, RISCV64>)
     return;
 
   auto less = [&](const ElfRel<E> &a, const ElfRel<E> &b) {
@@ -434,7 +499,7 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
   sorted_rels.resize(sections.size());
 
   for (i64 i = 1; i < sections.size(); i++) {
-    std::unique_ptr<InputSection<E>> &isec = sections[i];;
+    std::unique_ptr<InputSection<E>> &isec = sections[i];
     if (!isec || !isec->is_alive || !(isec->shdr().sh_flags & SHF_ALLOC))
       continue;
 
@@ -483,16 +548,10 @@ split_section(Context<E> &ctx, InputSection<E> &sec) {
                                                sec.shdr().sh_flags);
   rec->p2align = sec.p2align;
 
-  std::string_view data = sec.contents;
-
   // If thes section contents are compressed, uncompress them.
-  if (sec.is_compressed()) {
-    u8 *buf = new u8[sec.sh_size];
-    sec.uncompress(ctx, buf);
-    data = {(char *)buf, sec.sh_size};
-    ctx.string_pool.emplace_back(buf);
-  }
+  sec.uncompress(ctx);
 
+  std::string_view data = sec.contents;
   const char *begin = data.data();
   u64 entsize = sec.shdr().sh_entsize;
   HyperLogLog estimator;
@@ -688,11 +747,42 @@ void ObjectFile<E>::register_section_pieces(Context<E> &ctx) {
 }
 
 template <typename E>
+void ObjectFile<E>::fill_addrsig(Context<E> &ctx) {
+  if (llvm_addrsig) {
+    const u8 *start = reinterpret_cast<const u8 *>(llvm_addrsig->contents.data());
+    const u8 *end = start + llvm_addrsig->contents.size();
+    const u8 *cur = start;
+    while (cur != end) {
+      u64 symIndex = read_uleb(cur);
+      if (this->symbols[symIndex]->file != this) continue;
+      InputSection<E> *section = this->symbols[symIndex]->get_input_section();
+      if (section)
+        section->address_significant = true;
+    }
+  }
+
+  for (Symbol<E> *sym : this->symbols) {
+    if (sym->file != this) continue;
+    InputSection<E> *section = sym->get_input_section();
+    if (
+        section &&
+            (!llvm_addrsig // We don't have address significance information and needs to be safe
+                || (sym->is_imported || sym->is_exported)) // The symbol might be referenced from the
+                                                           // outside in an address-significant manner
+        ) {
+      section->address_significant = true;
+    }
+  }
+}
+
+template <typename E>
 void ObjectFile<E>::parse(Context<E> &ctx) {
   sections.resize(this->elf_sections.size());
   symtab_sec = this->find_section(SHT_SYMTAB);
 
   if (symtab_sec) {
+    // In ELF, all local symbols precede global symbols in the symbol table.
+    // sh_info has an index of the first global symbol.
     this->first_global = symtab_sec->sh_info;
     this->elf_syms = this->template get_data<ElfSym<E>>(ctx, *symtab_sec);
     symbol_strtab = this->get_string(ctx, symtab_sec->sh_link);
@@ -753,6 +843,11 @@ static u64 get_rank(const Symbol<E> &sym) {
   return get_rank(sym.file, sym.esym(), !sym.file->is_alive);
 }
 
+// Symbol's visibility is set to the most restrictive one. For example,
+// if one input file has a defined symbol `foo` with the default
+// visibility and the other input file has an undefined symbol `foo`
+// with the hidden visibility, the resulting symbol is a hidden defined
+// symbol.
 template <typename E>
 void ObjectFile<E>::merge_visibility(Context<E> &ctx, Symbol<E> &sym,
                                      u8 visibility) {
@@ -879,7 +974,7 @@ void ObjectFile<E>::eliminate_duplicate_comdat_groups() {
     if (group->owner == this->priority)
       continue;
 
-    std::span<u32> entries = pair.second;
+    std::span<ul32> entries = pair.second;
     for (u32 i : entries)
       if (sections[i])
         sections[i]->kill();
@@ -994,20 +1089,44 @@ void ObjectFile<E>::scan_relocations(Context<E> &ctx) {
   }
 }
 
+// Common symbols are used by C's tantative definitions. Tentative
+// definition is an obscure C feature which allows users to omit `extern`
+// from global variable declarations in a header file. For example, if you
+// have a tentative definition `int foo;` in a header which is included
+// into multiple translation units, `foo` will be included into multiple
+// object files, but it won't cause the duplicate symbol error. Instead,
+// the linker will merge them into a single instance of `foo`.
+//
+// If a header file contains a tentative definition `int foo;` and one of
+// a C file contains a definition with initial value such as `int foo = 5;`,
+// then the "real" definition wins. The symbol for the tentative definition
+// will be resolved to the real definition. If there is no "real"
+// definition, the tentative definition gets the default initial value 0.
+//
+// Tentative definitions are represented as "common symbols" in an object
+// file. In this function, we allocate spaces in .bss for remaining common
+// symbols that were not resolved to usual defined symbols in previous
+// passes.
 template <typename E>
 void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
   if (!has_common_symbol)
     return;
 
-  OutputSection<E> *osec =
+  OutputSection<E> *common =
     OutputSection<E>::get_instance(ctx, ".common", SHT_NOBITS,
                                    SHF_WRITE | SHF_ALLOC);
+
+  OutputSection<E> *tls_common =
+    OutputSection<E>::get_instance(ctx, ".tls_common", SHT_NOBITS,
+                                   SHF_WRITE | SHF_ALLOC | SHF_TLS);
 
   for (i64 i = this->first_global; i < this->elf_syms.size(); i++) {
     if (!this->elf_syms[i].is_common())
       continue;
 
     Symbol<E> &sym = *this->symbols[i];
+    std::scoped_lock lock(sym.mu);
+
     if (sym.file != this) {
       if (ctx.arg.warn_common)
         Warn(ctx) << *this << ": multiple common symbols: " << sym;
@@ -1016,17 +1135,20 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
 
     elf_sections2.push_back({});
     ElfShdr<E> &shdr = elf_sections2.back();
-
     memset(&shdr, 0, sizeof(shdr));
-    shdr.sh_flags = SHF_ALLOC;
+
+    bool is_tls = (sym.get_type() == STT_TLS);
+    shdr.sh_flags = is_tls ? (SHF_ALLOC | SHF_TLS) : SHF_ALLOC;
     shdr.sh_type = SHT_NOBITS;
     shdr.sh_size = this->elf_syms[i].st_size;
     shdr.sh_addralign = this->elf_syms[i].st_value;
 
     i64 idx = this->elf_sections.size() + elf_sections2.size() - 1;
     std::unique_ptr<InputSection<E>> isec =
-      std::make_unique<InputSection<E>>(ctx, *this, ".common", idx);
-    isec->output_section = osec;
+      std::make_unique<InputSection<E>>(ctx, *this,
+                                        is_tls ? ".tls_common" : ".common",
+                                        idx);
+    isec->output_section = is_tls ? tls_common : common;
 
     sym.file = this;
     sym.shndx = idx;
@@ -1121,9 +1243,9 @@ void ObjectFile<E>::write_symtab(Context<E> &ctx) {
     esym.st_name = strtab_off;
 
     if (sym.get_type() == STT_TLS)
-      esym.st_value = sym.get_addr(ctx) - ctx.tls_begin;
+      esym.st_value = sym.get_addr(ctx, false) - ctx.tls_begin;
     else
-      esym.st_value = sym.get_addr(ctx);
+      esym.st_value = sym.get_addr(ctx, false);
 
     if (InputSection<E> *isec = sym.get_input_section())
       esym.st_shndx = isec->output_section->shndx;
@@ -1185,6 +1307,7 @@ SharedFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
 template <typename E>
 SharedFile<E>::SharedFile(Context<E> &ctx, MappedFile<Context<E>> *mf)
   : InputFile<E>(ctx, mf) {
+  this->is_needed = ctx.as_needed;
   this->is_alive = !ctx.as_needed;
 }
 
@@ -1390,14 +1513,11 @@ void SharedFile<E>::write_symtab(Context<E> &ctx) {
 }
 
 #define INSTANTIATE(E)                                                  \
+  template class InputFile<E>;                                          \
   template class ObjectFile<E>;                                         \
   template class SharedFile<E>;                                         \
   template std::ostream &operator<<(std::ostream &, const InputFile<E> &)
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

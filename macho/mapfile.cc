@@ -30,7 +30,7 @@ void print_map(Context<E> &ctx) {
     if (file.is_alive) {
       out << "[" << std::setw(3) << i << "] " << file << "\n";
       for (Symbol<E> *sym : file.syms)
-        if (sym->file == &file)
+        if (sym && sym->file == &file)
           syms.push_back({sym->get_addr(ctx), 0, (u32)i, sym->name});
     }
   }
@@ -74,7 +74,6 @@ void print_map(Context<E> &ctx) {
 #define INSTANTIATE(E)                          \
   template void print_map(Context<E> &)
 
-INSTANTIATE(ARM64);
-INSTANTIATE(X86_64);
+INSTANTIATE_ALL;
 
 } // namespace mold::macho

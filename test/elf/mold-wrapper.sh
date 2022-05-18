@@ -1,20 +1,27 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
-ldd "$mold"-wrapper.so | grep -q libasan && { echo skipped; exit; }
+[ "$CC" = cc ] || { echo skipped; exit; }
+
+ldd mold-wrapper.so | grep -q libasan && { echo skipped; exit; }
+
+nm mold | grep -q '__[at]san_init' && { echo skipped; exit; }
 
 cat <<'EOF' > $t/a.sh
 #!/bin/bash
-echo "$0" "$@"
+echo "$0" "$@" $FOO
 EOF
 
 chmod 755 $t/a.sh
@@ -61,8 +68,8 @@ int main(int argc, char **argv) {
   }
 
   if (!strcmp(argv[1], "execvpe")) {
-    execvpe("/usr/bin/ld", (char *[]){"/usr/bin/ld", "execvpe", (char *)0},
-            environ);
+    char *env[] = {"FOO=bar", NULL};
+    execvpe("/usr/bin/ld", (char *[]){"/usr/bin/ld", "execvpe", (char *)0}, env);
     perror("execl");
     return 1;
   }
@@ -72,11 +79,16 @@ int main(int argc, char **argv) {
 }
 EOF
 
-LD_PRELOAD=$mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execl | grep -q 'a.sh execl'
-LD_PRELOAD=$mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execlp | grep -q 'a.sh execlp'
-LD_PRELOAD=$mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execle | grep -q 'a.sh execle'
-LD_PRELOAD=$mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execv | grep -q 'a.sh execv'
-LD_PRELOAD=$mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execvp | grep -q 'a.sh execvp'
-LD_PRELOAD=$mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execvpe | grep -q 'a.sh execvpe'
+LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execl | grep -q 'a.sh execl'
+LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execlp | grep -q 'a.sh execlp'
+LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execle | grep -q 'a.sh execle'
+LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execv | grep -q 'a.sh execv'
+LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execvp | grep -q 'a.sh execvp'
+LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh $t/exe execvpe | grep -q 'a.sh execvpe bar'
+
+valgrind="$(which valgrind 2> /dev/null; true)"
+if [ -n "$valgrind" ]; then
+  LD_PRELOAD=`pwd`/mold-wrapper.so MOLD_PATH=$t/a.sh "$valgrind" -q $t/exe execl | grep -q 'a.sh execl'
+fi
 
 echo OK

@@ -1,21 +1,24 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
 # IFUNC is not supported on RISC-V yet
-[ "$(uname -m)" = riscv64 ] && { echo skipped; exit; }
+[ $MACHINE = riscv64 ] && { echo skipped; exit; }
 
 # Skip if libc is musl because musl does not support GNU FUNC
 echo 'int main() {}' | $CC -o $t/exe -xc -
-ldd $t/exe | grep -q ld-musl && { echo OK; exit; }
+readelf --dynamic $t/exe | grep -q ld-musl && { echo OK; exit; }
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>
@@ -37,6 +40,6 @@ int main() {
 EOF
 
 $CC -B. -o $t/exe $t/a.o -static
-$t/exe | grep -q 'Hello world'
+$QEMU $t/exe | grep -q 'Hello world'
 
 echo OK

@@ -13,7 +13,7 @@ void StubsSection<X86_64>::copy_buf(Context<X86_64> &ctx) {
     static_assert(X86_64::stub_size == 6);
     buf[i * 6] = 0xff;
     buf[i * 6 + 1] = 0x25;
-    *(u32 *)(buf + i * 6 + 2) =
+    *(ul32 *)(buf + i * 6 + 2) =
       ctx.lazy_symbol_ptr.hdr.addr + i * X86_64::word_size -
       (this->hdr.addr + i * 6 + 6);
   }
@@ -34,9 +34,9 @@ void StubHelperSection<X86_64>::copy_buf(Context<X86_64> &ctx) {
   static_assert(sizeof(insn0) == X86_64::stub_helper_hdr_size);
 
   memcpy(buf, insn0, sizeof(insn0));
-  *(u32 *)(buf + 3) =
+  *(ul32 *)(buf + 3) =
     get_symbol(ctx, "__dyld_private")->get_addr(ctx) - this->hdr.addr - 7;
-  *(u32 *)(buf + 11) =
+  *(ul32 *)(buf + 11) =
     get_symbol(ctx, "dyld_stub_binder")->get_got_addr(ctx) - this->hdr.addr - 15;
 
   buf += 16;
@@ -50,8 +50,8 @@ void StubHelperSection<X86_64>::copy_buf(Context<X86_64> &ctx) {
     static_assert(sizeof(insn) == X86_64::stub_helper_size);
 
     memcpy(buf, insn, sizeof(insn));
-    *(u32 *)(buf + 1) = ctx.stubs.bind_offsets[i];
-    *(u32 *)(buf + 6) = start - buf - 10;
+    *(ul32 *)(buf + 1) = ctx.stubs.bind_offsets[i];
+    *(ul32 *)(buf + 6) = start - buf - 10;
     buf += 10;
   }
 }
@@ -71,9 +71,9 @@ static i64 get_reloc_addend(u32 type) {
 
 static i64 read_addend(u8 *buf, const MachRel &r) {
   if (r.p2size == 2)
-    return *(i32 *)(buf + r.offset) + get_reloc_addend(r.type);
+    return *(il32 *)(buf + r.offset) + get_reloc_addend(r.type);
   if (r.p2size == 3)
-    return *(i64 *)(buf + r.offset) + get_reloc_addend(r.type);
+    return *(il64 *)(buf + r.offset) + get_reloc_addend(r.type);
   unreachable();
 }
 
@@ -138,21 +138,22 @@ void Subsection<X86_64>::scan_relocations(Context<X86_64> &ctx) {
 
     switch (r.type) {
     case X86_64_RELOC_GOT_LOAD:
-      if (sym->file && sym->file->is_dylib())
+      if (sym->is_imported)
         sym->flags |= NEEDS_GOT;
       break;
     case X86_64_RELOC_GOT:
       sym->flags |= NEEDS_GOT;
       break;
     case X86_64_RELOC_TLV:
-      if (sym->file && sym->file->is_dylib())
+      if (sym->is_imported)
         sym->flags |= NEEDS_THREAD_PTR;
       break;
     }
 
-    if (sym->file && sym->file->is_dylib()) {
+    if (sym->is_imported) {
       sym->flags |= NEEDS_STUB;
-      ((DylibFile<X86_64> *)sym->file)->is_needed = true;
+      if (sym->file->is_dylib)
+        ((DylibFile<X86_64> *)sym->file)->is_needed = true;
     }
   }
 }
@@ -211,9 +212,9 @@ void Subsection<X86_64>::apply_reloc(Context<X86_64> &ctx, u8 *buf) {
       val -= get_addr(ctx) + r.offset + 4 + get_reloc_addend(r.type);
 
     if (r.p2size == 2)
-      *(u32 *)(buf + r.offset) = val;
+      *(ul32 *)(buf + r.offset) = val;
     else if (r.p2size == 3)
-      *(u64 *)(buf + r.offset) = val;
+      *(ul64 *)(buf + r.offset) = val;
     else
       unreachable();
   }

@@ -1,14 +1,19 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
+
+[ $MACHINE = x86_64 ] || { echo skipped; exit; }
 
 echo 'int main() {}' | $CC -m32 -o $t/exe -xc - >& /dev/null \
   || { echo skipped; exit; }
@@ -48,6 +53,6 @@ $CC -B. -o $t/exe -L$t/script -L$t/lib32 -L$t/lib64 \
 grep -q 'script/libfoo.so: skipping incompatible file' $t/log
 grep -q 'lib32/libfoo.so: skipping incompatible file' $t/log
 grep -q 'lib32/libfoo.a: skipping incompatible file' $t/log
-$t/exe | grep -q 'Hello world'
+$QEMU $t/exe | grep -q 'Hello world'
 
 echo OK

@@ -36,12 +36,10 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
                               std::string_view name, i64 shndx)
   : file(file), shndx(shndx) {
   if (shndx < file.elf_sections.size())
-    contents = {(char *)file.mf->data + shdr().sh_offset, shdr().sh_size};
-
-  bool compressed;
+    contents = {(char *)file.mf->data + shdr().sh_offset, (size_t)shdr().sh_size};
 
   if (name.starts_with(".zdebug")) {
-    sh_size = *(ubig64 *)&contents[4];
+    sh_size = *(ub64 *)&contents[4];
     p2align = to_p2align(shdr().sh_addralign);
     compressed = true;
   } else if (shdr().sh_flags & SHF_COMPRESSED) {
@@ -55,28 +53,37 @@ InputSection<E>::InputSection(Context<E> &ctx, ObjectFile<E> &file,
     compressed = false;
   }
 
-  // Uncompress early if the relocation is REL-type so that we can read
-  // addends from section contents. If RELA-type, we don't need to do this
-  // because addends are in relocations.
-  if (compressed && E::is_rel) {
-    u8 *buf = new u8[sh_size];
-    uncompress(ctx, buf);
-    contents = {(char *)buf, sh_size};
-    ctx.string_pool.emplace_back(buf);
-  }
+  // Sections may have been compressed. We usually uncompress them
+  // directly into the mmap'ed output file, but we want to uncompress
+  // early for REL-type ELF types to read relocation addends from
+  // section contents. For RELA-type, we don't need to do this because
+  // addends are in relocations.
+  if (E::is_rel)
+    uncompress(ctx);
 
   output_section =
     OutputSection<E>::get_instance(ctx, name, shdr().sh_type, shdr().sh_flags);
 }
 
 template <typename E>
-bool InputSection<E>::is_compressed() {
-  return !E::is_rel &&
-         (name().starts_with(".zdebug") || (shdr().sh_flags & SHF_COMPRESSED));
+void InputSection<E>::uncompress(Context<E> &ctx) {
+  if (!compressed || uncompressed)
+    return;
+
+  u8 *buf = new u8[sh_size];
+  uncompress_to(ctx, buf);
+  contents = {(char *)buf, sh_size};
+  ctx.string_pool.emplace_back(buf);
+  uncompressed = true;
 }
 
 template <typename E>
-void InputSection<E>::uncompress(Context<E> &ctx, u8 *buf) {
+void InputSection<E>::uncompress_to(Context<E> &ctx, u8 *buf) {
+  if (!compressed || uncompressed) {
+    memcpy(buf, contents.data(), contents.size());
+    return;
+  }
+
   auto do_uncompress = [&](std::string_view data) {
     unsigned long size = sh_size;
     if (::uncompress(buf, &size, (u8 *)data.data(), data.size()) != Z_OK)
@@ -100,7 +107,8 @@ void InputSection<E>::uncompress(Context<E> &ctx, u8 *buf) {
 
   ElfChdr<E> &hdr = *(ElfChdr<E> *)&contents[0];
   if (hdr.ch_type != ELFCOMPRESS_ZLIB)
-    Fatal(ctx) << *this << ": unsupported compression type";
+    Fatal(ctx) << *this << ": unsupported compression type: 0x"
+               << std::hex << hdr.ch_type;
   do_uncompress(contents.substr(sizeof(ElfChdr<E>)));
 }
 
@@ -131,12 +139,10 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
   bool is_writable = (shdr().sh_flags & SHF_WRITE);
 
   auto error = [&] {
-    if (sym.is_absolute())
-      Error(ctx) << *this << ": " << rel << " relocation against symbol `"
-                 << sym << "' can not be used; recompile with -fno-PIC";
-    else
-      Error(ctx) << *this << ": " << rel << " relocation against symbol `"
-                 << sym << "' can not be used; recompile with -fPIC";
+    std::string msg = sym.is_absolute() ? "-fno-PIC" : "-fPIC";
+    Error(ctx) << *this << ": " << rel << " relocation at offset 0x"
+               << std::hex << rel.r_offset << " against symbol `"
+               << sym << "' can not be used; recompile with " << msg;
   };
 
   auto warn_textrel = [&] {
@@ -170,6 +176,12 @@ void InputSection<E>::dispatch(Context<E> &ctx, Action table[3][4], i64 i,
   case PLT:
     sym.flags |= NEEDS_PLT;
     return;
+  case CPLT: {
+    std::scoped_lock lock(sym.mu);
+    sym.flags |= NEEDS_PLT;
+    sym.is_canonical = true;
+    return;
+  }
   case DYNREL:
     if (!is_writable) {
       if (ctx.arg.z_text) {
@@ -207,10 +219,10 @@ void InputSection<E>::write_to(Context<E> &ctx, u8 *buf) {
     return;
 
   // Copy data
-  if constexpr (E::e_machine == EM_RISCV) {
+  if constexpr (std::is_same_v<E, RISCV64>) {
     copy_contents_riscv(ctx, buf);
-  } else if (is_compressed()) {
-    uncompress(ctx, buf);
+  } else if (compressed) {
+    uncompress_to(ctx, buf);
   } else {
     memcpy(buf, contents.data(), contents.size());
   }
@@ -245,10 +257,6 @@ void report_undef(Context<E> &ctx, InputFile<E> &file, Symbol<E> &sym) {
   template void report_undef(Context<E> &, InputFile<E> &, Symbol<E> &)
 
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

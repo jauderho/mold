@@ -17,6 +17,8 @@
 #include <tbb/parallel_for_each.h>
 #include <zlib.h>
 
+#define CHECK(fn) do { int r = (fn); assert(r == Z_OK); } while (0)
+
 namespace mold {
 
 static constexpr i64 SHARD_SIZE = 1024 * 1024;
@@ -41,8 +43,8 @@ static std::vector<u8> do_compress(std::string_view input) {
   strm.zalloc = Z_NULL;
   strm.zfree = Z_NULL;
   strm.opaque = Z_NULL;
-  int r = deflateInit2(&strm, 1, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
-  assert(r == Z_OK);
+
+  CHECK(deflateInit2(&strm, 1, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY));
 
   // Set an input buffer
   strm.avail_in = input.size();
@@ -52,19 +54,43 @@ static std::vector<u8> do_compress(std::string_view input) {
   // on the compression size. +16 for Z_SYNC_FLUSH.
   std::vector<u8> buf(deflateBound(&strm, strm.avail_in) + 16);
 
+  // Compress data. It writes all compressed bytes except the last
+  // partial byte, so up to 7 bits can be held to be written to the
+  // buffer.
   strm.avail_out = buf.size();
   strm.next_out = buf.data();
+  CHECK(deflate(&strm, Z_BLOCK));
 
-  r = deflate(&strm, Z_SYNC_FLUSH);
-  assert(r == Z_OK);
+  // This is a workaround for libbacktrace before 2022-04-06.
+  //
+  // Zlib is a bit stream, and what Z_SYNC_FLUSH does is to write a
+  // three bit value indicating the start of an uncompressed data
+  // block followed by four byte data 00 00 ff ff which indicates that
+  // the length of the block is zero. libbacktrace uses its own zlib
+  // inflate routine, and it had a bug that if that particular three
+  // bit value happens to end at a byte boundary, it accidentally
+  // skipped the next byte.
+  //
+  // In order to avoid triggering that bug, we should avoid calling
+  // deflate() with Z_SYNC_FLUSH if the current bit position is 5.
+  // If it's 5, we insert an empty block consisting of 10 bits so
+  // that the bit position is 7 in the next byte.
+  //
+  // https://github.com/ianlancetaylor/libbacktrace/pull/87
+  int nbits;
+  deflatePending(&strm, Z_NULL, &nbits);
+  if (nbits == 5)
+    CHECK(deflatePrime(&strm, 10, 2));
+  CHECK(deflate(&strm, Z_SYNC_FLUSH));
+
   assert(strm.avail_out > 0);
-
   buf.resize(buf.size() - strm.avail_out);
   deflateEnd(&strm);
   return buf;
 }
 
-ZlibCompressor::ZlibCompressor(std::string_view input) {
+ZlibCompressor::ZlibCompressor(u8 *buf, i64 size) {
+  std::string_view input{(char *)buf, (size_t)size};
   std::vector<std::string_view> inputs = split(input);
   std::vector<u64> adlers(inputs.size());
   shards.resize(inputs.size());
@@ -109,7 +135,7 @@ void ZlibCompressor::write_to(u8 *buf) {
   end[-5] = 0;
 
   // Write a checksum
-  *(ubig32 *)(end - 4) = checksum;
+  *(ub32 *)(end - 4) = checksum;
 }
 
 GzipCompressor::GzipCompressor(std::string_view input) {
@@ -158,10 +184,10 @@ void GzipCompressor::write_to(u8 *buf) {
 
   // Write a trailer
   u8 *end = buf + size();
-  end[-10] = 0x3; // two-byte zlib stream terminator
+  end[-10] = 3; // two-byte zlib stream terminator
   end[-9] = 0;
-  *(u32 *)(end - 8) = checksum;
-  *(u32 *)(end - 4) = uncompressed_size;
+  *(ul32 *)(end - 8) = checksum;
+  *(ul32 *)(end - 4) = uncompressed_size;
 }
 
 } // namespace mold

@@ -1,12 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
@@ -35,6 +38,6 @@ EOF
 
 $CC -B. -shared -o $t/c.so $t/c.o
 $CC -B. -no-pie -o $t/exe $t/a.o $t/b.o $t/c.so
-$t/exe | grep -q '42 42 1'
+$QEMU $t/exe | grep -q '42 42 1'
 
 echo OK

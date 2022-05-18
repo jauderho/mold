@@ -1,8 +1,4 @@
-# If you want to enable ASAN, run `make` with the following options:
-#
-# make CXXFLAGS=-fsanitize=address LDFLAGS=-fsanitize=address USE_MIMALLOC=0
-
-VERSION = 1.1.1
+VERSION = 1.2.1
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
@@ -21,9 +17,6 @@ D = $(DESTDIR)
 ifeq ($(origin CXX), default)
   CXX = c++
 endif
-
-# Allow overriding pkg-config binary
-PKG_CONFIG = pkg-config
 
 # If you want to keep symbols in the installed binary, run make with
 # `STRIP=true` to run /bin/true instead of the strip command.
@@ -97,19 +90,17 @@ ifeq ($(OS), Linux)
   endif
 endif
 
-NEEDS_LIBCRYPTO = 0
-ifneq ($(OS), Darwin)
-  NEEDS_LIBCRYPTO = 1
+NEEDS_LIBCRYPTO = 1
+ifeq ($(OS), Darwin)
+  NEEDS_LIBCRYPTO = 0
 endif
 
 ifeq ($(NEEDS_LIBCRYPTO), 1)
-  MOLD_CXXFLAGS += $(shell $(PKG_CONFIG) --cflags-only-I openssl)
-  MOLD_LDFLAGS += $(shell $(PKG_CONFIG) --libs-only-L openssl) -lcrypto
+  MOLD_LDFLAGS += -lcrypto
 endif
 
-# '-latomic' flag is needed building on riscv64 system
-# RV32 system doesn't tested yet
-# seems like '-atomic' would be better but not working.
+# '-latomic' flag is needed building on riscv64 system.
+# Seems like '-atomic' would be better but not working.
 ifeq ($(ARCH), riscv64)
   MOLD_LDFLAGS += -latomic
 endif
@@ -132,7 +123,7 @@ all: mold mold-wrapper.so
 mold: $(OBJS) $(MIMALLOC_LIB) $(TBB_LIB)
 	$(CXX) $(OBJS) -o $@ $(MOLD_LDFLAGS) $(LDFLAGS)
 	ln -sf mold ld
-	ln -sf mold ld64.mold
+	ln -sf mold ld64
 
 mold-wrapper.so: elf/mold-wrapper.c
 	$(CC) $(DEPFLAGS) $(CFLAGS) -fPIC -shared -o $@ $< $(MOLD_WRAPPER_LDFLAGS) $(LDFLAGS)
@@ -161,12 +152,28 @@ ifeq ($(OS), Darwin)
 else
 	$(MAKE) -C test -f Makefile.linux --no-print-directory --output-sync
 endif
-
 	@if test -t 1; then \
 	  printf '\e[32mPassed all tests\e[0m\n'; \
 	else \
 	  echo 'Passed all tests'; \
 	fi
+
+test-arch:
+	TEST_CC=${TRIPLE}-gcc \
+	TEST_CXX=${TRIPLE}-g++ \
+	TEST_GCC=${TRIPLE}-gcc \
+	TEST_GXX=${TRIPLE}-g++ \
+	OBJDUMP=${TRIPLE}-objdump \
+	MACHINE=${MACHINE} \
+	QEMU="qemu-${MACHINE} -L /usr/${TRIPLE}" \
+	$(MAKE) test
+
+test-all: all
+	$(MAKE) test-arch TRIPLE=x86_64-linux-gnu MACHINE=x86_64
+	$(MAKE) test-arch TRIPLE=i686-linux-gnu MACHINE=i386
+	$(MAKE) test-arch TRIPLE=aarch64-linux-gnu MACHINE=aarch64
+	$(MAKE) test-arch TRIPLE=arm-linux-gnueabihf MACHINE=arm
+	$(MAKE) test-arch TRIPLE=riscv64-linux-gnu MACHINE=riscv64
 
 install: all
 	$(INSTALL) -d $D$(BINDIR)
@@ -178,7 +185,12 @@ install: all
 	$(STRIP) $D$(LIBDIR)/mold/mold-wrapper.so
 
 	$(INSTALL) -d $D$(LIBEXECDIR)/mold
-	ln -sf $(BINDIR)/mold $D$(LIBEXECDIR)/mold/ld
+
+# We want to make a symblink with a relative path, so that users can
+# move the entire directory to other place without breaking the reference.
+# GNU ln supports `--relative` to do that, but that's not supported by
+# non-GNU systems. So we use Python to compute a relative path.
+	ln -sf `python3 -c "import os.path; print(os.path.relpath('$(BINDIR)/mold', '$(LIBEXECDIR)/mold'))"` $D$(LIBEXECDIR)/mold/ld
 
 	$(INSTALL) -d $D$(MANDIR)/man1
 	$(INSTALL_DATA) docs/mold.1 $D$(MANDIR)/man1
@@ -191,7 +203,13 @@ uninstall:
 	rm -f $D$(MANDIR)/man1/mold.1
 	rm -rf $D$(LIBDIR)/mold
 
-clean:
-	rm -rf *~ mold mold-wrapper.so out ld ld64.mold
+test-asan test-ubsan:
+	$(MAKE) USE_MIMALLOC=0 CXXFLAGS='-fsanitize=address -fsanitize=undefined -O0 -g' LDFLAGS='-fsanitize=address -fsanitize=undefined' test
 
-.PHONY: all test tests check clean
+test-tsan:
+	$(MAKE) USE_MIMALLOC=0 CXXFLAGS='-fsanitize=thread -O0 -g' LDFLAGS=-fsanitize=thread test
+
+clean:
+	rm -rf *~ mold mold-wrapper.so out ld ld64 mold-*-linux.tar.gz
+
+.PHONY: all test tests check clean test-arch test-all test-asan test-ubsan test-tsan

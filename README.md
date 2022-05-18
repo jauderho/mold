@@ -22,13 +22,13 @@ mold is so fast that it is only 2x _slower_ than `cp` on the same
 machine. Feel free to [file a bug](https://github.com/rui314/mold/issues)
 if you find mold is not faster than other linkers.
 
-mold currently supports x86-64, i386, ARM64 and 64-bit RISC-V.
+mold currently supports x86-64, i386, ARM32, ARM64 and 64-bit RISC-V.
 
 ## Why does the speed of linking matter?
 
 If you are using a compiled language such as C, C++ or Rust, a build
-consists of two phases. In the first phase, a compiler compiles a
-source file into an object file (`.o` files). In the second phase,
+consists of two phases. In the first phase, a compiler compiles
+source files into object files (`.o` files). In the second phase,
 a linker takes all object files to combine them into a single executable
 or a shared library file.
 
@@ -39,7 +39,7 @@ most noticeable when you are in rapid debug-edit-rebuild cycles.
 
 ## Install
 
-Binary packages for the following distros are currently available.
+Binary packages for the following systems are currently available.
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/mold.svg)](https://repology.org/project/mold/versions)
 
@@ -47,32 +47,21 @@ Binary packages for the following distros are currently available.
 
 mold is written in C++20, so if you build mold yourself, you need a
 recent version of a C++ compiler and a C++ standard library. GCC 10.2
-or Clang 12.0.0 as well as libstdc++ 10 or libc++ 7 are recommended.
-
-I'm using Ubuntu 20.04 as a development platform. In that environment,
-you can build mold by the following commands.
+or Clang 12.0.0 (or later) as well as libstdc++ 10 or libc++ 7 (or
+later) are recommended.
 
 ### Install dependencies
 
-#### Ubuntu 20.04 and later / Debian 11 and later
-
-```shell
-sudo apt-get update
-sudo apt-get install -y build-essential git clang cmake libstdc++-10-dev libssl-dev libxxhash-dev zlib1g-dev pkg-config
-```
-
-#### Fedora 34 and later
-
-```shell
-sudo dnf install -y git clang cmake openssl-devel xxhash-devel zlib-devel libstdc++-devel
-```
+To install build dependencies, run `./install-build-deps.sh` in this
+directory. It recognizes your Linux distribution and tries to install
+necessary packages. You may want to run it as root.
 
 ### Compile mold
 
 ```shell
 git clone https://github.com/rui314/mold.git
 cd mold
-git checkout v1.1.1
+git checkout v1.2.1
 make -j$(nproc) CXX=clang++
 sudo make install
 ```
@@ -86,11 +75,10 @@ By default, `mold` is installed to `/usr/local/bin`.
 If you don't use a recent enough Linux distribution, or if for any reason
 `make` in the above commands doesn't work for you, you can use Docker to
 build it in a Docker environment. To do so, just run `./dist.sh` in this
-directory instead of running `make -j$(nproc)`. The shell script creates a
-Ubuntu 18.04 Docker image, installs necessary tools and libraries to it,
-builds mold and auxiliary files, and packs them into a single tar file
-`mold-$version-$arch-linux.tar.gz`. You can extract the tar file anywhere
-and use `mold` executable in it.
+directory instead of running `make -j$(nproc)`. The shell script pulls a
+Docker image, builds mold and auxiliary files inside it, and packs
+them into a single tar file `mold-$version-$arch-linux.tar.gz`.
+You can extract the tar file anywhere and use `mold` executable in it.
 
 `make test` depends on a few more packages. To install, run the following commands:
 
@@ -115,7 +103,7 @@ following flags to use `mold` instead of `/usr/bin/ld`:
 
 - Clang: pass `-fuse-ld=mold`
 
-- GCC 12.1.0 (upcoming version) or later: pass `-fuse-ld=mold`
+- GCC 12.1.0 or later: pass `-fuse-ld=mold`
 
 - GCC before 12.1.0: `-fuse-ld` does not accept `mold` as a valid
   argument, so you need to use `-B` option instead. `-B` is an option
@@ -123,7 +111,7 @@ following flags to use `mold` instead of `/usr/bin/ld`:
 
   If you have installed mold with `make install`, there should be a
   directory named `/usr/libexec/mold` (or `/usr/local/libexec/mold`,
-  depending on your $PREFIX), and `ld` command should be there. The
+  depending on your `$PREFIX`), and `ld` command should be there. The
   `ld` is actually a symlink to `mold`. So, all you need is to pass
   `-B/usr/libexec/mold` (or `-B/usr/local/libexec/mold`) to GCC.
 
@@ -170,13 +158,21 @@ replace `argv[0]` with `mold` if it is `ld`, `ld.gold` or `ld.lld`.
 
 </details>
 
+<details><summary>GitHub Action</summary>
+If you want to use mold in your GitHub-hosted CI to speed up continuous
+build, you can use <a href=https://github.com/rui314/setup-mold>setup-mold</a>
+GitHub Action. GitHub runs a CI on a two-core machine, but mold is
+still significantly faster than the default GNU linker there
+especially when a program being linked is large.
+</details>
+
 <details><summary>Verify that you are using mold</summary>
 
 mold leaves its identification string in `.comment` section in an output
 file. You can print it out to verify that you are actually using mold.
 
 ```shell
-readelf -p .comment <executable-file>
+$ readelf -p .comment <executable-file>
 
 String dump of section '.comment':
   [     0]  GCC: (Ubuntu 10.2.0-5ubuntu1~20.04) 10.2.0
@@ -206,6 +202,21 @@ artificially capped to 16 so that the bars fit in the GIF.
 
 For details, please read [design notes](docs/design.md).
 
-# Logo
+## License
 
--![mold image](docs/mold.jpg)
+mold is available under AGPL. Note that that does not mean that you
+have to license your program under AGPL if you use mold to link your
+program. An output of the mold linker is a derived work of the object
+files and libraries you pass to the linker but not a derived work of
+the mold linker itself.
+
+Besides that, you can also buy a commercial, non-AGPL license with
+technical support from our company, Blue Whale Systems PTE LTD. If you
+are a big company, please consider obtaining it before making hundreds
+or thousands of developers of your company to depend on mold. mold is
+mostly a single-person open-source project, and just like other
+open-source projects, we are not legally obligated to keep maintaining
+it. A legally-binding commercial license contract addresses the
+concern. By purchasing a license, you are guaranteed that mold will be
+maintained for you. Please [contact us](mailto:contact@bluewhale.systems)
+for a commercial license inquiry.

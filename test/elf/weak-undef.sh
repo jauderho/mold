@@ -1,12 +1,15 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
 
@@ -35,9 +38,9 @@ $CC -B. -o $t/exe2 $t/b.o -no-pie
 $CC -B. -o $t/exe3 $t/a.o $t/c.o -pie
 $CC -B. -o $t/exe4 $t/b.o $t/c.o -no-pie
 
-$t/exe1 | grep -q '^-1$'
-$t/exe2 | grep -q '^-1$'
-$t/exe3 | grep -q '^2$'
-$t/exe4 | grep -q '^2$'
+$QEMU $t/exe1 | grep -q '^-1$'
+$QEMU $t/exe2 | grep -q '^-1$'
+$QEMU $t/exe3 | grep -q '^2$'
+$QEMU $t/exe4 | grep -q '^2$'
 
 echo OK

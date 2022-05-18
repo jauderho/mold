@@ -45,8 +45,8 @@ static void print_bytes(u8 *buf, i64 size) {
 
 struct ExportEntry {
   std::string name;
-  u32 flags;
-  u64 addr;
+  ul32 flags;
+  ul64 addr;
 };
 
 static void read_trie(std::vector<ExportEntry> &vec, u8 *start, i64 offset = 0,
@@ -178,9 +178,9 @@ void dump_file(std::string path) {
 
   MachHeader &hdr = *(MachHeader *)buf;
   std::cout << "magic: 0x" << std::hex << hdr.magic
-            << "\ncputype: 0x" << hdr.cputype
-            << "\ncpusubtype: 0x" << hdr.cpusubtype
-            << "\nfiletype: 0x" << hdr.filetype
+            << "\ncputype: 0x" << (u32)hdr.cputype
+            << "\ncpusubtype: 0x" << (u32)hdr.cpusubtype
+            << "\nfiletype: 0x" << (u32)hdr.filetype
             << "\nncmds: 0x" << hdr.ncmds
             << "\nsizeofcmds: 0x" << hdr.sizeofcmds
             << "\nflags: 0x" << hdr.flags
@@ -311,7 +311,7 @@ void dump_file(std::string path) {
                   << "\n  p2align: " << std::dec << sec[j].p2align
                   << "\n  reloff: " << std::hex << sec[j].reloff
                   << "\n  nreloc: " << std::dec << sec[j].nreloc
-                  << "\n  type: 0x" << std::hex << sec[j].type
+                  << "\n  type: 0x" << std::hex << (u32)sec[j].type
                   << "\n  attr: 0x" << std::hex << sec[j].attr
                   << "\n";
 
@@ -326,10 +326,10 @@ void dump_file(std::string path) {
             std::cout << "  reloc: "
                       << "\n   offset: 0x" << rel[k].offset
                       << "\n   idx: 0x" << rel[k].idx
-                      << "\n   is_pcrel: " << rel[k].is_pcrel
-                      << "\n   p2size: 0x" << rel[k].p2size
-                      << "\n   is_extern: " << rel[k].is_extern
-                      << "\n   type: " << rel[k].type
+                      << "\n   is_pcrel: " << (u32)rel[k].is_pcrel
+                      << "\n   p2size: 0x" << (u32)rel[k].p2size
+                      << "\n   is_extern: " << (u32)rel[k].is_extern
+                      << "\n   type: " << (u32)rel[k].type
                       << "\n";
           }
         }

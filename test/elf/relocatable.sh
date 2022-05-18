@@ -1,14 +1,20 @@
 #!/bin/bash
 export LC_ALL=C
 set -e
-CC="${CC:-cc}"
-CXX="${CXX:-c++}"
+CC="${TEST_CC:-cc}"
+CXX="${TEST_CXX:-c++}"
+GCC="${TEST_GCC:-gcc}"
+GXX="${TEST_GXX:-g++}"
+OBJDUMP="${OBJDUMP:-objdump}"
+MACHINE="${MACHINE:-$(uname -m)}"
 testname=$(basename "$0" .sh)
 echo -n "Testing $testname ... "
 cd "$(dirname "$0")"/../..
-mold="$(pwd)/mold"
 t=out/test/elf/$testname
 mkdir -p $t
+
+# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98667
+[ $MACHINE = i386 ] && { echo skipped; exit; }
 
 cat <<EOF | $CXX -c -o $t/a.o -xc++ -
 int one() { return 1; }
@@ -36,7 +42,7 @@ int b() {
 }
 EOF
 
-"$mold" --relocatable -o $t/c.o $t/a.o $t/b.o
+./mold --relocatable -o $t/c.o $t/a.o $t/b.o
 
 [ -f $t/c.o ]
 ! [ -x t/c.o ] || false
@@ -58,6 +64,6 @@ int main() {
 EOF
 
 $CXX -B. -o $t/exe $t/c.o $t/d.o
-$t/exe | grep -q '^1 2 3$'
+$QEMU $t/exe | grep -q '^1 2 3$'
 
 echo OK

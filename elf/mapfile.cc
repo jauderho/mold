@@ -40,6 +40,9 @@ static Map<E> get_map(Context<E> &ctx) {
     }
   });
 
+  if (map.size() <= 1)
+    return map;
+
   tbb::parallel_for(map.range(), [](const typename Map<E>::range_type &range) {
     for (auto it = range.begin(); it != range.end(); it++) {
       std::vector<Symbol<E> *> &vec = it->second;
@@ -63,15 +66,16 @@ void print_map(Context<E> &ctx) {
   Map<E> map = get_map(ctx);
 
   // Print a mapfile.
-  *out << "             VMA       Size Align Out     In      Symbol\n";
+  *out << "               VMA       Size Align Out     In      Symbol\n";
 
   for (Chunk<E> *osec : ctx.chunks) {
-    *out << std::setw(16) << (u64)osec->shdr.sh_addr
+    *out << std::showbase
+         << std::setw(18) << std::hex << (u64)osec->shdr.sh_addr << std::dec
          << std::setw(11) << (u64)osec->shdr.sh_size
          << std::setw(6) << (u64)osec->shdr.sh_addralign
          << " " << osec->name << "\n";
 
-    if (!osec->is_output_section())
+    if (osec->kind() != OUTPUT_SECTION)
       continue;
 
     std::span<InputSection<E> *> members = ((OutputSection<E> *)osec)->members;
@@ -81,8 +85,10 @@ void print_map(Context<E> &ctx) {
       InputSection<E> *mem = members[i];
       std::ostringstream ss;
       opt_demangle = ctx.arg.demangle;
+      u64 addr = osec->shdr.sh_addr + mem->offset;
 
-      ss << std::setw(16) << (osec->shdr.sh_addr + mem->offset)
+      ss << std::showbase
+         << std::setw(18) << std::hex << addr << std::dec
          << std::setw(11) << (u64)mem->sh_size
          << std::setw(6) << (1 << (u64)mem->p2align)
          << "         " << *mem << "\n";
@@ -90,7 +96,8 @@ void print_map(Context<E> &ctx) {
       typename Map<E>::const_accessor acc;
       if (map.find(acc, mem))
         for (Symbol<E> *sym : acc->second)
-          ss << std::setw(16) << sym->get_addr(ctx)
+          ss << std::showbase
+             << std::setw(18) << std::hex << sym->get_addr(ctx) << std::dec
              << "          0     0                 "
              << *sym << "\n";
 
@@ -105,10 +112,6 @@ void print_map(Context<E> &ctx) {
 #define INSTANTIATE(E)                          \
   template void print_map(Context<E> &ctx);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

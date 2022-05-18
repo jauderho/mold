@@ -1,7 +1,8 @@
 #pragma once
 
-#include "big-endian.h"
+#include "inttypes.h"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cassert>
@@ -49,6 +50,9 @@ template <typename C> class OutputFile;
 inline char *output_tmpfile;
 inline char *socket_tmpfile;
 inline thread_local bool opt_demangle;
+
+inline u8 *output_buffer_start = nullptr;
+inline u8 *output_buffer_end = nullptr;
 
 extern const std::string mold_version;
 
@@ -159,24 +163,42 @@ private:
 // Utility functions
 //
 
+// Some C++ libraries haven't implemented std::has_single_bit yet.
+inline bool has_single_bit(u64 val) {
+  return std::popcount(val) == 1;
+}
+
+// Some C++ libraries haven't implemented std::bit_ceil yet.
+inline u64 bit_ceil(u64 val) {
+  if (has_single_bit(val))
+    return val;
+  return (u64)1 << (64 - std::countl_zero(val));
+}
+
 inline u64 align_to(u64 val, u64 align) {
   if (align == 0)
     return val;
-  assert(std::popcount(align) == 1);
+  assert(has_single_bit(align));
   return (val + align - 1) & ~(align - 1);
 }
 
 inline u64 align_down(u64 val, u64 align) {
-  assert(std::popcount(align) == 1);
+  assert(has_single_bit(align));
   return val & ~(align - 1);
 }
 
-inline u64 next_power_of_two(u64 val) {
-  assert(val >> 63 == 0);
-  if (val == 0 || val == 1)
-    return 1;
-  return (u64)1 << (64 - std::countl_zero(val - 1));
+inline u64 bit(u64 val, i64 pos) {
+  return (val >> pos) & 1;
+};
+
+// Returns [hi:lo] bits of val.
+inline u64 bits(u64 val, u64 hi, u64 lo) {
+  return (val >> lo) & (((u64)1 << (hi - lo + 1)) - 1);
 }
+
+inline i64 sign_extend(u64 val, i64 size) {
+  return (i64)(val << (63 - size)) >> (63 - size);
+};
 
 template <typename T, typename Compare = std::less<T>>
 void update_minimum(std::atomic<T> &atomic, u64 new_val, Compare cmp = {}) {
@@ -215,14 +237,14 @@ inline void sort(T &vec, U less) {
   std::stable_sort(vec.begin(), vec.end(), less);
 }
 
-inline i64 write_string(u8 *buf, std::string_view str) {
+inline i64 write_string(void *buf, std::string_view str) {
   memcpy(buf, str.data(), str.size());
-  buf[str.size()] = '\0';
+  *((u8 *)buf + str.size()) = '\0';
   return str.size() + 1;
 }
 
 template <typename T>
-inline i64 write_vector(u8 *buf, const std::vector<T> &vec) {
+inline i64 write_vector(void *buf, const std::vector<T> &vec) {
   i64 sz = vec.size() * sizeof(T);
   memcpy(buf, vec.data(), sz);
   return sz;
@@ -256,6 +278,10 @@ inline u64 read_uleb(u8 *&buf) {
     shift += 7;
   } while (byte & 0x80);
   return val;
+}
+
+inline u64 read_uleb(u8 const*&buf) {
+  return read_uleb(const_cast<u8 *&>(buf));
 }
 
 inline i64 uleb_size(u64 val) {
@@ -305,7 +331,7 @@ public:
   void resize(i64 nbuckets) {
     this->~ConcurrentMap();
 
-    nbuckets = std::max<i64>(MIN_NBUCKETS, next_power_of_two(nbuckets));
+    nbuckets = std::max<i64>(MIN_NBUCKETS, bit_ceil(nbuckets));
 
     this->nbuckets = nbuckets;
     keys = (std::atomic<const char *> *)calloc(nbuckets, sizeof(keys[0]));
@@ -317,7 +343,7 @@ public:
     if (!keys)
       return {nullptr, false};
 
-    assert(std::popcount<u64>(nbuckets) == 1);
+    assert(has_single_bit(nbuckets));
     i64 idx = hash & (nbuckets - 1);
     i64 retry = 0;
 
@@ -351,7 +377,7 @@ public:
   }
 
   bool has_key(i64 idx) {
-    return keys[idx];
+    return keys[idx].load(std::memory_order_relaxed);
   }
 
   static constexpr i64 MIN_NBUCKETS = 2048;
@@ -376,10 +402,28 @@ private:
 };
 
 //
-// threads.cc
+// output-file.h
 //
 
-void set_thread_count(i64 n);
+template <typename C>
+class OutputFile {
+public:
+  static std::unique_ptr<OutputFile<C>>
+  open(C &ctx, std::string path, i64 filesize, i64 perm);
+
+  virtual void close(C &ctx) = 0;
+  virtual ~OutputFile() = default;
+
+  u8 *buf = nullptr;
+  std::string path;
+  i64 filesize;
+  bool is_mmapped;
+  bool is_unmapped = false;
+
+protected:
+  OutputFile(std::string path, i64 filesize, bool is_mmapped)
+    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
 
 //
 // hyperloglog.cc
@@ -408,6 +452,12 @@ private:
 };
 
 //
+// uuid.cc
+//
+
+std::array<u8, 16> get_uuid_v4();
+
+//
 // filepath.cc
 //
 
@@ -432,7 +482,7 @@ std::string_view demangle(std::string_view name);
 
 class ZlibCompressor {
 public:
-  ZlibCompressor(std::string_view input);
+  ZlibCompressor(u8 *buf, i64 size);
   void write_to(u8 *buf);
   i64 size() const;
 
@@ -590,6 +640,12 @@ public:
       // because archive members may have the same name.
       return parent->name + ":" + std::to_string(get_offset());
     }
+
+    if (thin_parent) {
+      // If this is a thin archive member, the filename part is
+      // guaranteed to be unique.
+      return thin_parent->name + ":" + name;
+    }
     return name;
   }
 
@@ -599,14 +655,12 @@ public:
   i64 mtime = 0;
   bool given_fullpath = true;
   MappedFile *parent = nullptr;
+  MappedFile *thin_parent = nullptr;
   int fd = -1;
 };
 
 template <typename C>
 MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
-  MappedFile *mf = new MappedFile;
-  mf->name = path;
-
   if (path.starts_with('/') && !ctx.arg.chroot.empty())
     path = ctx.arg.chroot + "/" + path_clean(path);
 
@@ -614,12 +668,14 @@ MappedFile<C> *MappedFile<C>::open(C &ctx, std::string path) {
   if (fd == -1)
     return nullptr;
 
-  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
-
   struct stat st;
   if (fstat(fd, &st) == -1)
     Fatal(ctx) << path << ": fstat failed: " << errno_string();
 
+  MappedFile *mf = new MappedFile;
+  ctx.mf_pool.push_back(std::unique_ptr<MappedFile>(mf));
+
+  mf->name = path;
   mf->size = st.st_size;
 
 #ifdef __APPLE__

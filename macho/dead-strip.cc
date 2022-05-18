@@ -83,17 +83,17 @@ static void mark(Context<E> &ctx, const std::vector<Subsection<E> *> &rootset) {
 
 template <typename E>
 static void sweep(Context<E> &ctx) {
+  for (ObjectFile<E> *file : ctx.objs)
+    for (Symbol<E> *&sym : file->syms)
+      if (sym->file == file && sym->subsec && !sym->subsec->is_alive)
+        sym = nullptr;
+
   for (ObjectFile<E> *file : ctx.objs) {
     std::erase_if(file->subsections,
                   [](const std::unique_ptr<Subsection<E>> &subsec) {
       return !subsec->is_alive;
     });
   }
-
-  for (ObjectFile<E> *file : ctx.objs)
-    for (Symbol<E> *&sym : file->syms)
-      if (sym->file == file && sym->subsec && !sym->subsec->is_alive)
-        sym = nullptr;
 }
 
 template <typename E>
@@ -106,7 +106,6 @@ void dead_strip(Context<E> &ctx) {
 #define INSTANTIATE(E)                          \
   template void dead_strip(Context<E> &)
 
-INSTANTIATE(ARM64);
-INSTANTIATE(X86_64);
+INSTANTIATE_ALL;
 
 } // namespace mold::macho

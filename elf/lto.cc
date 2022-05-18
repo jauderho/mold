@@ -79,13 +79,14 @@
 //     the compiler backend.
 
 #include "mold.h"
-#include "../lto.h"
+#include "lto.h"
 
 #include <cstdarg>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sstream>
+#include <tbb/parallel_for_each.h>
 #include <unistd.h>
 
 #if 0
@@ -302,6 +303,44 @@ get_symbols(const void *handle, int nsyms, PluginSymbol *psyms, bool is_v2) {
     psyms[i].resolution = get_resolution(esym, sym);
   }
   return LDPS_OK;
+}
+
+// This function restarts mold itself with `--:lto-pass2` and
+// `--:ignore-ir-file` flags. We do this as a workaround for the old
+// linker plugins that do not support the get_symbols_v3 API.
+//
+// get_symbols_v1 and get_symbols_v2 don't provide a way to ignore an
+// object file we previously passed to the linker plugin. So we can't
+// "unload" object files in archives that we ended up not choosing to
+// include into the final output.
+//
+// As a workaround, we restart the linker with a list of object files
+// the linker has to ignore, so that it won't read the object files
+// from archives next time.
+//
+// This is an ugly hack and should be removed once GCC adopts the v3 API.
+template <typename E>
+static void restart_process(Context<E> &ctx) {
+  std::vector<const char *> args;
+
+  for (std::string_view arg : ctx.cmdline_args)
+    args.push_back(strdup(std::string(arg).c_str()));
+
+  for (std::unique_ptr<ObjectFile<E>> &file : ctx.obj_pool)
+    if (file->is_lto_obj && !file->is_alive)
+      args.push_back(strdup(("--:ignore-ir-file=" +
+                             file->mf->get_identifier()).c_str()));
+
+  args.push_back("--:lto-pass2");
+  args.push_back(nullptr);
+
+  std::string self = std::filesystem::read_symlink("/proc/self/exe");
+
+  std::cout << std::flush;
+  std::cerr << std::flush;
+  execv(self.c_str(), (char * const *)args.data());
+  std::cerr << "execv failed: " << errno_string() << "\n";
+  _exit(1);
 }
 
 template <typename E>
@@ -564,44 +603,6 @@ ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile<Context<E>> *mf) {
   return obj;
 }
 
-// This function restarts mold itself with `--:lto-pass2` and
-// `--:ignore-ir-file` flags. We do this as a workaround for the old
-// linker plugins that do not support the get_symbols_v3 API.
-//
-// get_symbols_v1 and get_symbols_v2 don't provide a way to ignore an
-// object file we previously passed to the linker plugin. So we can't
-// "unload" object files in archives that we ended up not choosing to
-// include into the final output.
-//
-// As a workaround, we restart the linker with a list of object files
-// the linker has to ignore, so that it won't read the object files
-// from archives next time.
-//
-// This is an ugly hack and should be removed once GCC adopts the v3 API.
-template <typename E>
-static void restart_process(Context<E> &ctx) {
-  std::vector<const char *> args;
-
-  for (std::string_view arg : ctx.cmdline_args)
-    args.push_back(strdup(std::string(arg).c_str()));
-
-  for (std::unique_ptr<ObjectFile<E>> &file : ctx.obj_pool)
-    if (file->is_lto_obj && !file->is_alive)
-      args.push_back(strdup(("--:ignore-ir-file=" +
-                             file->mf->get_identifier()).c_str()));
-
-  args.push_back("--:lto-pass2");
-  args.push_back(nullptr);
-
-  std::string self = std::filesystem::read_symlink("/proc/self/exe");
-
-  std::cout << std::flush;
-  std::cerr << std::flush;
-  execv(self.c_str(), (char * const *)args.data());
-  std::cerr << "execv failed: " << errno_string() << "\n";
-  _exit(1);
-}
-
 // Entry point
 template <typename E>
 std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
@@ -614,21 +615,21 @@ std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx) {
   phase = 2;
 
   // Set `referenced_by_regular_obj` bit.
-  for (ObjectFile<E> *file : ctx.objs) {
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     if (file->is_lto_obj)
-      continue;
+      return;
 
     for (i64 i = file->first_global; i < file->symbols.size(); i++) {
       ElfSym<E> &esym = file->elf_syms[i];
       Symbol<E> &sym = *file->symbols[i];
 
-      if (esym.is_undef() && sym.file && sym.file != file &&
-          !sym.file->is_dso && ((ObjectFile<E> *)sym.file)->is_lto_obj) {
+      if (sym.file && !sym.file->is_dso &&
+          ((ObjectFile<E> *)sym.file)->is_lto_obj) {
         std::scoped_lock lock(sym.mu);
         sym.referenced_by_regular_obj = true;
       }
     }
-  }
+  });
 
   // all_symbols_read_hook() calls add_input_file() and add_input_library()
   LOG << "all symbols read\n";
@@ -652,10 +653,6 @@ void lto_cleanup(Context<E> &ctx) {
   template std::vector<ObjectFile<E> *> do_lto(Context<E> &);           \
   template void lto_cleanup(Context<E> &)
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf

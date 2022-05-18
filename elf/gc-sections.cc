@@ -11,13 +11,17 @@ namespace mold::elf {
 
 template <typename E>
 static bool is_init_fini(const InputSection<E> &isec) {
-  return isec.shdr().sh_type == SHT_INIT_ARRAY ||
-         isec.shdr().sh_type == SHT_FINI_ARRAY ||
-         isec.shdr().sh_type == SHT_PREINIT_ARRAY ||
-         isec.name().starts_with(".ctors") ||
-         isec.name().starts_with(".dtors") ||
-         isec.name().starts_with(".init") ||
-         isec.name().starts_with(".fini");
+  u32 type = isec.shdr().sh_type;
+  std::string_view name = isec.name();
+
+  return type == SHT_INIT_ARRAY ||
+         type == SHT_FINI_ARRAY ||
+         type == SHT_PREINIT_ARRAY ||
+         (std::is_same_v<E, ARM32> && type == SHT_ARM_EXIDX) ||
+         name.starts_with(".ctors") ||
+         name.starts_with(".dtors") ||
+         name.starts_with(".init") ||
+         name.starts_with(".fini");
 }
 
 template <typename E>
@@ -98,11 +102,12 @@ collect_root_set(Context<E> &ctx) {
       // reduce the amount of non-memory-mapped segments, you should
       // use `strip` command, compile without debug info or use
       // -strip-all linker option.
-      if (!(isec->shdr().sh_flags & SHF_ALLOC))
+      u32 flags = isec->shdr().sh_flags;
+      if (!(flags & SHF_ALLOC))
         isec->extra().is_visited = true;
 
       if (is_init_fini(*isec) || is_c_identifier(isec->name()) ||
-          isec->shdr().sh_type == SHT_NOTE)
+          (flags & SHF_GNU_RETAIN) || isec->shdr().sh_type == SHT_NOTE)
         enqueue_section(isec.get());
     }
   });
@@ -197,10 +202,6 @@ void gc_sections(Context<E> &ctx) {
 #define INSTANTIATE(E)                                  \
   template void gc_sections(Context<E> &ctx);
 
-INSTANTIATE(X86_64);
-INSTANTIATE(I386);
-INSTANTIATE(ARM64);
-INSTANTIATE(ARM32);
-INSTANTIATE(RISCV64);
+INSTANTIATE_ALL;
 
 } // namespace mold::elf
