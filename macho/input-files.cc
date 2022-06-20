@@ -1,5 +1,4 @@
 #include "mold.h"
-
 #include "../archive-file.h"
 
 namespace mold::macho {
@@ -7,9 +6,9 @@ namespace mold::macho {
 template <typename E>
 std::ostream &operator<<(std::ostream &out, const InputFile<E> &file) {
   if (file.archive_name.empty())
-    out << path_clean(file.mf->name);
+    out << path_clean(file.filename);
   else
-    out << path_clean(file.archive_name) << "(" << path_clean(file.mf->name) + ")";
+    out << path_clean(file.archive_name) << "(" << path_clean(file.filename) + ")";
   return out;
 }
 
@@ -19,12 +18,12 @@ void InputFile<E>::clear_symbols() {
     std::scoped_lock lock(sym->mu);
     if (sym->file == this) {
       sym->file = nullptr;
-      sym->is_extern = false;
+      sym->scope = SCOPE_LOCAL;
       sym->is_imported = false;
+      sym->is_weak_def = false;
       sym->subsec = nullptr;
       sym->value = 0;
       sym->is_common = false;
-      sym->is_weak_def = false;
     }
   }
 }
@@ -33,8 +32,7 @@ template <typename E>
 ObjectFile<E> *
 ObjectFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf,
                       std::string archive_name) {
-  ObjectFile<E> *obj = new ObjectFile<E>;
-  obj->mf = mf;
+  ObjectFile<E> *obj = new ObjectFile<E>(mf);
   obj->archive_name = archive_name;
   obj->is_alive = archive_name.empty() || ctx.all_load;
   obj->is_hidden = ctx.hidden_l;
@@ -59,8 +57,18 @@ void ObjectFile<E>::parse(Context<E> &ctx) {
 
   parse_sections(ctx);
   parse_symbols(ctx);
-  split_subsections(ctx);
-  parse_data_in_code(ctx);
+
+  MachHeader &mach_hdr = *(MachHeader *)this->mf->data;
+  if (mach_hdr.flags & MH_SUBSECTIONS_VIA_SYMBOLS)
+    split_subsections_via_symbols(ctx);
+  else
+    init_subsections(ctx);
+
+  sort(subsections, [](Subsection<E> *a, Subsection<E> *b) {
+    return a->input_addr < b->input_addr;
+  });
+
+  fix_subsec_members(ctx);
 
   for (std::unique_ptr<InputSection<E>> &isec : sections)
     if (isec)
@@ -112,7 +120,7 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
 
   i64 nlocal = 0;
   for (MachSym &msym : mach_syms)
-    if (!msym.ext)
+    if (!msym.is_extern)
       nlocal++;
   local_syms.reserve(nlocal);
 
@@ -120,7 +128,7 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
     MachSym &msym = mach_syms[i];
     std::string_view name = (char *)(this->mf->data + cmd->stroff + msym.stroff);
 
-    if (msym.ext) {
+    if (msym.is_extern) {
       this->syms.push_back(get_symbol(ctx, name));
     } else {
       local_syms.emplace_back(name);
@@ -128,7 +136,7 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
 
       sym.file = this;
       sym.subsec = nullptr;
-      sym.is_extern = false;
+      sym.scope = SCOPE_LOCAL;
       sym.is_common = false;
       sym.is_weak_def = false;
 
@@ -142,7 +150,8 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
         // `value` and `subsec` will be filled by split_subsections
         break;
       default:
-        Fatal(ctx) << sym << ": unknown symbol type: " << (u64)msym.type;
+        Fatal(ctx) << *this << ": unknown symbol type for "
+                   << sym << ": " << (u64)msym.type;
       }
 
       this->syms.push_back(&sym);
@@ -164,18 +173,21 @@ struct SplitInfo {
 };
 
 template <typename E>
-static std::vector<SplitInfo<E>> split(Context<E> &ctx, ObjectFile<E> &file) {
-  std::vector<SplitInfo<E>> vec;
+static std::vector<SplitInfo<E>>
+split_regular_sections(Context<E> &ctx, ObjectFile<E> &file) {
+  std::vector<SplitInfo<E>> vec(file.sections.size());
 
-  for (std::unique_ptr<InputSection<E>> &isec : file.sections)
-    vec.push_back({isec.get()});
+  for (i64 i = 0; i < file.sections.size(); i++)
+    if (InputSection<E> *isec = file.sections[i].get())
+      if (!isec->hdr.match("__TEXT", "__cstring"))
+        vec[i].isec = isec;
 
   // Find all symbols whose type is N_SECT.
   for (i64 i = 0; i < file.mach_syms.size(); i++) {
     MachSym &msym = file.mach_syms[i];
-    if (msym.type == N_SECT && file.sections[msym.sect - 1]) {
+    if (msym.type == N_SECT && vec[msym.sect - 1].isec) {
       SplitRegion r;
-      r.offset = msym.value - file.sections[msym.sect - 1]->hdr.addr;
+      r.offset = msym.value - vec[msym.sect - 1].isec->hdr.addr;
       r.symidx = i;
       r.is_alt_entry = (msym.desc & N_ALT_ENTRY);
       vec[msym.sect - 1].regions.push_back(r);
@@ -224,37 +236,107 @@ static std::vector<SplitInfo<E>> split(Context<E> &ctx, ObjectFile<E> &file) {
 }
 
 template <typename E>
-void ObjectFile<E>::split_subsections(Context<E> &ctx) {
+void ObjectFile<E>::split_subsections_via_symbols(Context<E> &ctx) {
   sym_to_subsec.resize(mach_syms.size());
 
-  // Split a section into subsections.
-  for (SplitInfo<E> &info : split(ctx, *this)) {
+  auto add = [&](InputSection<E> &isec, u32 offset, u32 size, u8 p2align) {
+    Subsection<E> *subsec = new Subsection<E>{
+      .isec = isec,
+      .input_offset = offset,
+      .input_size = size,
+      .input_addr = (u32)(isec.hdr.addr + offset),
+      .p2align = p2align,
+    };
+
+    subsec_pool.emplace_back(subsec);
+    subsections.push_back(subsec);
+  };
+
+  // Split regular sections into subsections.
+  for (SplitInfo<E> &info : split_regular_sections(ctx, *this)) {
     InputSection<E> &isec = *info.isec;
-
     for (SplitRegion &r : info.regions) {
-      if (!r.is_alt_entry) {
-        Subsection<E> *subsec = new Subsection<E>{
-          .isec = isec,
-          .input_offset = r.offset,
-          .input_size = r.size,
-          .input_addr = (u32)(isec.hdr.addr + r.offset),
-          .p2align = (u8)isec.hdr.p2align,
-        };
-        subsections.emplace_back(subsec);
-      }
-
+      if (!r.is_alt_entry)
+        add(isec, r.offset, r.size, isec.hdr.p2align);
       if (r.symidx != -1)
-        sym_to_subsec[r.symidx] = subsections.size() - 1;
+        sym_to_subsec[r.symidx] = subsections.back();
     }
   }
 
-  // Fix local symbols `subsec` members.
+  // Split __cstring section.
+  for (std::unique_ptr<InputSection<E>> &isec : sections) {
+    if (isec && isec->hdr.match("__TEXT", "__cstring")) {
+      std::string_view str = isec->contents;
+      size_t pos = 0;
+
+      while (pos < str.size()) {
+        size_t end = str.find('\0', pos);
+        if (end == str.npos)
+          Fatal(ctx) << *this << " corruupted __TEXT,__cstring";
+
+        end = str.find_first_not_of('\0', end);
+        if (end == str.npos)
+          end = str.size();
+
+        // A constant string in __cstring has no alignment info, so we
+        // need to infer it.
+        u8 p2align = std::min<u8>(isec->hdr.p2align, std::countr_zero(pos));
+        add(*isec, pos, end - pos, p2align);
+        pos = end;
+      }
+    }
+  }
+}
+
+template <typename E>
+void ObjectFile<E>::init_subsections(Context<E> &ctx) {
+  subsections.resize(sections.size());
+
+  for (i64 i = 0; i < sections.size(); i++) {
+    if (InputSection<E> *isec = sections[i].get()) {
+      Subsection<E> *subsec = new Subsection<E>{
+        .isec = *isec,
+        .input_offset = 0,
+        .input_size = (u32)isec->hdr.size,
+        .input_addr = (u32)isec->hdr.addr,
+        .p2align = (u8)isec->hdr.p2align,
+      };
+      subsec_pool.emplace_back(subsec);
+      subsections[i] = subsec;
+    }
+  }
+
+  sym_to_subsec.resize(mach_syms.size());
+
   for (i64 i = 0; i < mach_syms.size(); i++) {
     MachSym &msym = mach_syms[i];
-    if (!msym.ext && msym.type == N_SECT) {
-      Symbol<E> &sym = *this->syms[i];
-      sym.subsec = subsections[sym_to_subsec[i]].get();
-      sym.value = msym.value - sym.subsec->input_addr;
+    if (msym.type == N_SECT)
+      sym_to_subsec[i] = subsections[msym.sect - 1];
+  }
+
+  std::erase(subsections, nullptr);
+}
+
+// Fix local symbols `subsec` members.
+template <typename E>
+void ObjectFile<E>::fix_subsec_members(Context<E> &ctx) {
+  for (i64 i = 0; i < mach_syms.size(); i++) {
+    MachSym &msym = mach_syms[i];
+    Symbol<E> &sym = *this->syms[i];
+
+    if (!msym.is_extern && msym.type == N_SECT) {
+      Subsection<E> *subsec = sym_to_subsec[i];
+      if (!subsec)
+        subsec = find_subsection(ctx, msym.value);
+
+      if (subsec) {
+        sym.subsec = subsec;
+        sym.value = msym.value - subsec->input_addr;
+      } else {
+        // Subsec is null if a symbol is in a __compact_unwind.
+        sym.subsec = nullptr;
+        sym.value = msym.value;
+      }
     }
   }
 }
@@ -267,6 +349,24 @@ void ObjectFile<E>::parse_data_in_code(Context<E> &ctx) {
       cmd->datasize / sizeof(DataInCodeEntry),
     };
   }
+}
+
+template <typename E>
+std::vector<std::string> ObjectFile<E>::get_linker_options(Context<E> &ctx) {
+  if (get_file_type(this->mf) == FileType::LLVM_BITCODE)
+    return {};
+
+  auto *cmd = (LinkerOptionCommand *)find_load_command(ctx, LC_LINKER_OPTION);
+  if (!cmd)
+    return {};
+
+  char *buf = (char *)cmd + sizeof(*cmd);
+  std::vector<std::string> vec;
+  for (i64 i = 0; i < cmd->count; i++) {
+    vec.push_back(buf);
+    buf += vec.back().size() + 1;
+  }
+  return vec;
 }
 
 template <typename E>
@@ -284,22 +384,23 @@ LoadCommand *ObjectFile<E>::find_load_command(Context<E> &ctx, u32 type) {
 }
 
 template <typename E>
-i64 ObjectFile<E>::find_subsection_idx(Context<E> &ctx, u32 addr) {
-  auto it = std::upper_bound(
-      subsections.begin(), subsections.end(), addr,
-      [&](u32 addr, const std::unique_ptr<Subsection<E>> &subsec) {
+Subsection<E> *ObjectFile<E>::find_subsection(Context<E> &ctx, u32 addr) {
+  auto it = std::upper_bound(subsections.begin(), subsections.end(), addr,
+                             [&](u32 addr, Subsection<E> *subsec) {
     return addr < subsec->input_addr;
   });
 
   if (it == subsections.begin())
-    return -1;
-  return it - subsections.begin() - 1;
+    return nullptr;
+  return *(it - 1);
 }
 
 template <typename E>
-Subsection<E> *ObjectFile<E>::find_subsection(Context<E> &ctx, u32 addr) {
-  i64 i = find_subsection_idx(ctx, addr);
-  return (i == -1) ? nullptr : subsections[i].get();
+Symbol<E> *ObjectFile<E>::find_symbol(Context<E> &ctx, u32 addr) {
+  for (i64 i = 0; i < mach_syms.size(); i++)
+    if (MachSym &msym = mach_syms[i]; msym.is_extern && msym.value == addr)
+      return this->syms[i];
+  return nullptr;
 }
 
 template <typename E>
@@ -346,15 +447,21 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
       break;
     }
     case offsetof(CompactUnwindEntry, personality):
-      if (!r.is_extern)
-        error();
-      dst.personality = this->syms[r.idx];
+      if (r.is_extern) {
+        dst.personality = this->syms[r.idx];
+      } else {
+        u32 addr = *(ul32 *)((u8 *)this->mf->data + hdr.offset + r.offset);
+        dst.personality = find_symbol(ctx, addr);
+        if (!dst.personality)
+          Fatal(ctx) << *this << ": __compact_unwind: unsupported local "
+                     << "personality reference: " << i;
+      }
       break;
     case offsetof(CompactUnwindEntry, lsda): {
       if (r.is_extern)
         error();
 
-      i32 addr = *(il32 *)((u8 *)this->mf->data + hdr.offset + r.offset);
+      u32 addr = *(ul32 *)((u8 *)this->mf->data + hdr.offset + r.offset);
       Subsection<E> *target = find_subsection(ctx, addr);
       if (!target)
         error();
@@ -369,7 +476,7 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
 
   for (i64 i = 0; i < num_entries; i++)
     if (!unwind_records[i].subsec)
-      Fatal(ctx) << ": __compact_unwind: missing relocation at " << i;
+      Fatal(ctx) << "__compact_unwind: missing relocation at " << i;
 
   // Sort unwind entries by offset
   sort(unwind_records, [](const UnwindRecord<E> &a, const UnwindRecord<E> &b) {
@@ -403,15 +510,15 @@ void ObjectFile<E>::parse_compact_unwind(Context<E> &ctx, MachSection &hdr) {
 //
 // Ties are broken by file priority.
 template <typename E>
-static u64 get_rank(InputFile<E> *file, bool is_common, bool is_weak,
-                    bool is_lazy) {
+static u64 get_rank(InputFile<E> *file, bool is_common, bool is_weak) {
   if (is_common) {
-    if (is_lazy)
+    assert(!file->is_dylib);
+    if (!file->is_alive)
       return (6 << 24) + file->priority;
     return (5 << 24) + file->priority;
   }
 
-  if (file->is_dylib || is_lazy) {
+  if (file->is_dylib || !file->is_alive) {
     if (is_weak)
       return (4 << 24) + file->priority;
     return (3 << 24) + file->priority;
@@ -426,25 +533,40 @@ template <typename E>
 static u64 get_rank(Symbol<E> &sym) {
   if (!sym.file)
     return 7 << 24;
-  return get_rank(sym.file, sym.is_common, sym.is_weak_def, !sym.file->is_alive);
+  return get_rank(sym.file, sym.is_common, sym.is_weak_def);
 }
 
 template <typename E>
 void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
+  auto is_private_extern = [&](MachSym &msym) {
+    return this->is_hidden || msym.is_private_extern ||
+           ((msym.desc & N_WEAK_REF) && (msym.desc & N_WEAK_DEF));
+  };
+
+  auto merge_scope = [&](Symbol<E> &sym, MachSym &msym) {
+    // If at least one symbol defines it as an EXTERN symbol,
+    // the result is an EXTERN symbol instead of PRIVATE_EXTERN,
+    // so that the symbol is exported.
+    if (sym.scope == SCOPE_EXTERN)
+      return SCOPE_EXTERN;
+    return is_private_extern(msym) ? SCOPE_PRIVATE_EXTERN : SCOPE_EXTERN;
+  };
+
   for (i64 i = 0; i < this->syms.size(); i++) {
     MachSym &msym = mach_syms[i];
-    if (!msym.ext || msym.is_undef())
+    if (!msym.is_extern || msym.is_undef())
       continue;
 
     Symbol<E> &sym = *this->syms[i];
     std::scoped_lock lock(sym.mu);
+    bool is_weak_def = (msym.desc & N_WEAK_DEF);
 
-    if (get_rank(this, msym.is_common(), msym.desc & N_WEAK_DEF, false) <
-        get_rank(sym)) {
+    sym.scope = merge_scope(sym, msym);
+
+    if (get_rank(this, msym.is_common(), is_weak_def) < get_rank(sym)) {
       sym.file = this;
-      sym.is_extern = (msym.ext && !this->is_hidden);
       sym.is_imported = false;
-      sym.is_weak_def = (msym.desc & N_WEAK_DEF);
+      sym.is_weak_def = is_weak_def;
 
       switch (msym.type) {
       case N_UNDF:
@@ -459,7 +581,7 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
         sym.is_common = false;
         break;
       case N_SECT:
-        sym.subsec = subsections[sym_to_subsec[i]].get();
+        sym.subsec = sym_to_subsec[i];
         sym.value = msym.value - sym.subsec->input_addr;
         sym.is_common = false;
         break;
@@ -473,12 +595,13 @@ void ObjectFile<E>::resolve_symbols(Context<E> &ctx) {
 template <typename E>
 bool ObjectFile<E>::is_objc_object(Context<E> &ctx) {
   for (std::unique_ptr<InputSection<E>> &isec : sections)
-    if (isec->hdr.match("__DATA", "__objc_catlist") ||
-        isec->hdr.match("__TEXT", "__swift"))
+    if (isec)
+      if (isec->hdr.match("__DATA", "__objc_catlist") ||
+          isec->hdr.match("__TEXT", "__swift"))
       return true;
 
   for (i64 i = 0; i < this->syms.size(); i++)
-    if (!mach_syms[i].is_undef() && mach_syms[i].ext &&
+    if (!mach_syms[i].is_undef() && mach_syms[i].is_extern &&
         this->syms[i]->name.starts_with("_OBJC_CLASS_$_"))
       return true;
   return false;
@@ -492,7 +615,7 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
 
   for (i64 i = 0; i < this->syms.size(); i++) {
     MachSym &msym = mach_syms[i];
-    if (!msym.ext)
+    if (!msym.is_extern)
       continue;
 
     Symbol<E> &sym = *this->syms[i];
@@ -509,7 +632,7 @@ ObjectFile<E>::mark_live_objects(Context<E> &ctx,
 
 template <typename E>
 void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
-  for (i64 i = 0; i < this->syms.size(); i++) {
+  for (i64 i = 0; i < this->mach_syms.size(); i++) {
     Symbol<E> &sym = *this->syms[i];
     MachSym &msym = mach_syms[i];
 
@@ -524,17 +647,17 @@ void ObjectFile<E>::convert_common_symbols(Context<E> &ctx) {
       subsections.emplace_back(subsec);
 
       sym.is_imported = false;
+      sym.is_weak_def = false;
       sym.subsec = subsec;
       sym.value = 0;
       sym.is_common = false;
-      sym.is_weak_def = false;
     }
   }
 }
 
 template <typename E>
 void ObjectFile<E>::check_duplicate_symbols(Context<E> &ctx) {
-  for (i64 i = 0; i < this->syms.size(); i++) {
+  for (i64 i = 0; i < this->mach_syms.size(); i++) {
     Symbol<E> *sym = this->syms[i];
     MachSym &msym = mach_syms[i];
     if (sym && sym->file && sym->file != this && !msym.is_undef() &&
@@ -598,7 +721,7 @@ void ObjectFile<E>::parse_lto_symbols(Context<E> &ctx) {
     case LTO_SYMBOL_SCOPE_DEFAULT:
     case LTO_SYMBOL_SCOPE_PROTECTED:
     case LTO_SYMBOL_SCOPE_DEFAULT_CAN_BE_HIDDEN:
-      msym.ext = true;
+      msym.is_extern = true;
       break;
     default:
       unreachable();
@@ -612,10 +735,22 @@ void ObjectFile<E>::parse_lto_symbols(Context<E> &ctx) {
 
 template <typename E>
 DylibFile<E> *DylibFile<E>::create(Context<E> &ctx, MappedFile<Context<E>> *mf) {
-  DylibFile<E> *dylib = new DylibFile<E>;
-  dylib->mf = mf;
-  dylib->is_needed = (ctx.needed_l || !ctx.arg.dead_strip_dylibs);
+  DylibFile<E> *dylib = new DylibFile<E>(mf);
+  dylib->is_alive = (ctx.needed_l || !ctx.arg.dead_strip_dylibs);
+  dylib->is_weak = ctx.weak_l;
   ctx.dylib_pool.emplace_back(dylib);
+
+  switch (get_file_type(mf)) {
+  case FileType::TAPI:
+    dylib->parse_tapi(ctx);
+    break;
+  case FileType::MACH_DYLIB:
+    dylib->parse_dylib(ctx);
+    break;
+  default:
+    Fatal(ctx) << mf->name << ": is not a dylib";
+  }
+
   return dylib;
 };
 
@@ -641,6 +776,20 @@ void DylibFile<E>::read_trie(Context<E> &ctx, u8 *start, i64 offset,
     i64 off = read_uleb(buf);
     read_trie(ctx, start, off, prefix + suffix);
   }
+}
+
+template <typename E>
+void DylibFile<E>::parse_tapi(Context<E> &ctx) {
+  TextDylib tbd = parse_tbd(ctx, this->mf);
+
+  for (std::string_view s : tbd.exports)
+    this->syms.push_back(get_symbol(ctx, s));
+
+  for (std::string_view s : tbd.weak_exports)
+    this->syms.push_back(get_symbol(ctx, s));
+
+  install_name = tbd.install_name;
+  reexported_libs = tbd.reexported_libs;
 }
 
 template <typename E>
@@ -675,36 +824,18 @@ void DylibFile<E>::parse_dylib(Context<E> &ctx) {
 }
 
 template <typename E>
-void DylibFile<E>::parse(Context<E> &ctx) {
-  switch (get_file_type(this->mf)) {
-  case FileType::TAPI: {
-    TextDylib tbd = parse_tbd(ctx, this->mf);
-    for (std::string_view sym : tbd.exports)
-      this->syms.push_back(get_symbol(ctx, sym));
-    install_name = tbd.install_name;
-    break;
-  }
-  case FileType::MACH_DYLIB:
-    parse_dylib(ctx);
-    break;
-  default:
-    Fatal(ctx) << this->mf->name << ": is not a dylib";
-  }
-}
-
-template <typename E>
 void DylibFile<E>::resolve_symbols(Context<E> &ctx) {
   for (Symbol<E> *sym : this->syms) {
     std::scoped_lock lock(sym->mu);
 
-    if (get_rank(this, false, false, false) < get_rank(*sym)) {
+    if (get_rank(this, false, false) < get_rank(*sym)) {
       sym->file = this;
-      sym->is_extern = true;
+      sym->scope = SCOPE_LOCAL;
       sym->is_imported = true;
+      sym->is_weak_def = this->is_weak;
       sym->subsec = nullptr;
       sym->value = 0;
       sym->is_common = false;
-      sym->is_weak_def = false;
     }
   }
 }

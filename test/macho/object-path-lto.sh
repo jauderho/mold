@@ -13,10 +13,15 @@ cd "$(dirname "$0")"/../..
 t=out/test/macho/$testname
 mkdir -p $t
 
-echo 'int main() {}' | $CC -o $t/exe -xc -
-./ld64 -dump $t/exe > $t/log
+cat <<EOF | $CC -o $t/a.o -c -xc - -flto
+#include <stdio.h>
+int main() {
+  printf("Hello world\n");
+}
+EOF
 
-grep -q 'magic: 0xfeedfacf' $t/log
-grep -q 'segname: __PAGEZERO' $t/log
+clang --ld-path=./ld64 -o $t/exe $t/a.o -flto -Wl,-object_path_lto,$t/obj
+$t/exe | grep -q 'Hello world'
+otool -l $t/obj > /dev/null
 
 echo OK

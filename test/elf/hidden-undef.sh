@@ -23,6 +23,6 @@ int main() { foo(); }
 EOF
 
 ! $CC -B. -o $t/exe $t/a.so $t/b.o >& $t/log
-grep -q 'undefined symbol: .*b.o: foo' $t/log
+grep -q 'undefined symbol: foo' $t/log
 
 echo OK
