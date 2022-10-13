@@ -1,28 +1,7 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-if [ $MACHINE = x86_64 ]; then
-  dialect=gnu
-elif [ $MACHINE = aarch64 ]; then
-  dialect=trad
-else
-  echo skipped
-  exit
-fi
-
-cat <<EOF | $GCC -ftls-model=local-dynamic -mtls-dialect=$dialect -fPIC -c -o $t/a.o -xc -
+cat <<EOF | $CC -fPIC -ftls-model=local-dynamic -c -o $t/a.o -xc -
 #include <stdio.h>
 
 extern _Thread_local int foo;
@@ -39,14 +18,12 @@ int main() {
 }
 EOF
 
-cat <<EOF | $GCC -ftls-model=local-dynamic -mtls-dialect=$dialect  -fPIC -c -o $t/b.o -xc -
+cat <<EOF | $GCC -fPIC -ftls-model=local-dynamic -c -o $t/b.o -xc -
 _Thread_local int foo = 3;
 EOF
 
-$CC -B. -o $t/exe $t/a.o $t/b.o
+$CC -B. -o $t/exe $t/a.o $t/b.o -Wl,-relax
 $QEMU $t/exe | grep -q '3 5 3 5'
 
 $CC -B. -o $t/exe $t/a.o $t/b.o -Wl,-no-relax
 $QEMU $t/exe | grep -q '3 5 3 5'
-
-echo OK

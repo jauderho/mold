@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -o $t/a.o -ffunction-sections -c -xc -
 #include <stdio.h>
@@ -40,5 +28,3 @@ $QEMU $t/exe4 | grep -q 'Hello world'
 ! diff $t/exe1 $t/exe2 >& /dev/null || false
 diff $t/exe2 $t/exe3
 ! diff $t/exe3 $t/exe4 >& /dev/null || false
-
-echo OK

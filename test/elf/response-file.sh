@@ -1,25 +1,20 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-[ $MACHINE = x86_64 ] || { echo skipped; exit; }
+cat <<EOF | $CC -c -o $t/a.o -xc -
+void foo();
+void bar();
+int main() { foo(); bar(); }
+EOF
 
-echo '.globl _start; _start: jmp loop' | $CC -o $t/a.o -c -x assembler -
-echo '.globl loop; loop: jmp loop' | $CC -o $t/b.o -c -x assembler -
-echo "-o '$t/exe' '$t/a.o' '$t/b.o'" > $t/rsp
-./mold -static @$t/rsp
-$OBJDUMP -d $t/exe > /dev/null
-file $t/exe | grep -q ELF
+cat <<EOF | $CC -c -o $t/b.o -xc -
+void foo() {}
+EOF
 
-echo OK
+cat <<EOF | $CC -c -o $t/c.o -xc -
+void bar() {}
+EOF
+
+echo "'$t/b.o' '$t/c.o'" > $t/rsp
+
+$CC -o $t/exe $t/a.o -Wl,@$t/rsp

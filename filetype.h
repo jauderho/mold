@@ -11,7 +11,9 @@ enum class FileType {
   ELF_OBJ,
   ELF_DSO,
   MACH_OBJ,
+  MACH_EXE,
   MACH_DYLIB,
+  MACH_BUNDLE,
   MACH_UNIVERSAL,
   AR,
   THIN_AR,
@@ -73,23 +75,35 @@ FileType get_file_type(MappedFile<C> *mf) {
     return FileType::EMPTY;
 
   if (data.starts_with("\177ELF")) {
-    switch (*(ul16 *)(data.data() + 16)) {
-    case 1: {
-      // ET_REL
-      elf::Elf32Ehdr &ehdr = *(elf::Elf32Ehdr *)data.data();
+    u8 byte_order = ((elf::EL32Ehdr *)data.data())->e_ident[elf::EI_DATA];
 
-      if (ehdr.e_ident[elf::EI_CLASS] == elf::ELFCLASS32) {
-        if (is_gcc_lto_obj<elf::I386>(mf))
-          return FileType::GCC_LTO_OBJ;
-      } else {
-        if (is_gcc_lto_obj<elf::X86_64>(mf))
-          return FileType::GCC_LTO_OBJ;
+    if (byte_order == elf::ELFDATA2LSB) {
+      elf::EL32Ehdr &ehdr = *(elf::EL32Ehdr *)data.data();
+
+      if (ehdr.e_type == elf::ET_REL) {
+        if (ehdr.e_ident[elf::EI_CLASS] == elf::ELFCLASS32) {
+          if (is_gcc_lto_obj<elf::I386>(mf))
+            return FileType::GCC_LTO_OBJ;
+        } else {
+          if (is_gcc_lto_obj<elf::X86_64>(mf))
+            return FileType::GCC_LTO_OBJ;
+        }
+        return FileType::ELF_OBJ;
       }
 
-      return FileType::ELF_OBJ;
-    }
-    case 3: // ET_DYN
-      return FileType::ELF_DSO;
+      if (ehdr.e_type == elf::ET_DYN)
+        return FileType::ELF_DSO;
+    } else {
+      elf::EB32Ehdr &ehdr = *(elf::EB32Ehdr *)data.data();
+
+      if (ehdr.e_type == elf::ET_REL) {
+        if (is_gcc_lto_obj<elf::SPARC64>(mf))
+          return FileType::GCC_LTO_OBJ;
+        return FileType::ELF_OBJ;
+      }
+
+      if (ehdr.e_type == elf::ET_DYN)
+        return FileType::ELF_DSO;
     }
     return FileType::UNKNOWN;
   }
@@ -98,8 +112,12 @@ FileType get_file_type(MappedFile<C> *mf) {
     switch (*(ul32 *)(data.data() + 12)) {
     case 1: // MH_OBJECT
       return FileType::MACH_OBJ;
+    case 2: // MH_EXECUTE
+      return FileType::MACH_EXE;
     case 6: // MH_DYLIB
       return FileType::MACH_DYLIB;
+    case 8: // MH_BUNDLE
+      return FileType::MACH_BUNDLE;
     }
     return FileType::UNKNOWN;
   }
@@ -127,8 +145,10 @@ inline std::string filetype_to_string(FileType type) {
   case FileType::EMPTY: return "EMPTY";
   case FileType::ELF_OBJ: return "ELF_OBJ";
   case FileType::ELF_DSO: return "ELF_DSO";
+  case FileType::MACH_EXE: return "MACH_EXE";
   case FileType::MACH_OBJ: return "MACH_OBJ";
   case FileType::MACH_DYLIB: return "MACH_DYLIB";
+  case FileType::MACH_BUNDLE: return "MACH_BUNDLE";
   case FileType::MACH_UNIVERSAL: return "MACH_UNIVERSAL";
   case FileType::AR: return "AR";
   case FileType::THIN_AR: return "THIN_AR";

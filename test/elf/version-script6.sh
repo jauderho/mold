@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<'EOF' > $t/a.ver
 VER_X1 { foo; };
@@ -45,5 +33,3 @@ readelf --dyn-syms $t/f.so > $t/log
 grep -q 'foo@VER_X1' $t/log
 grep -q 'bar@VER_X2' $t/log
 grep -q 'baz@@VER_Y2' $t/log
-
-echo OK

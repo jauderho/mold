@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -o $t/long-long-long-filename.o -c -xc -
 int three() { return 3; }
@@ -37,10 +25,8 @@ rm -f $t/d.a
 
 $CC -B. -Wl,--trace -o $t/exe $t/c.o $t/d.a > $t/log
 
-fgrep -q 'static-archive/d.a(long-long-long-filename.o)' $t/log
-fgrep -q 'static-archive/d.a(b.o)' $t/log
-fgrep -q static-archive/c.o $t/log
+grep -Fq 'static-archive/d.a(long-long-long-filename.o)' $t/log
+grep -Fq 'static-archive/d.a(b.o)' $t/log
+grep -Fq static-archive/c.o $t/log
 
 $QEMU $t/exe | grep -q '8'
-
-echo OK

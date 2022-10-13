@@ -1,24 +1,7 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-# IFUNC is not supported on RISC-V yet
-[ $MACHINE = riscv64 ] && { echo skipped; exit; }
-
-# Skip if libc is musl because musl does not support GNU FUNC
-echo 'int main() {}' | $CC -o $t/exe -xc -
-readelf --dynamic $t/exe | grep -q ld-musl && { echo OK; exit; }
+supports_ifunc || skip
 
 cat <<EOF | $CC -c -fPIC -o $t/a.o -xc -
 #include <stdio.h>
@@ -39,5 +22,3 @@ EOF
 
 $CC -B. -shared -o $t/b.so $t/a.o
 readelf --dyn-syms $t/b.so | grep -Eq '(IFUNC|<OS specific>: 10)\s+GLOBAL DEFAULT   .* foobar'
-
-echo OK

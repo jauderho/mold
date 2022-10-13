@@ -1,41 +1,26 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-[ $MACHINE = x86_64 ] || { echo skipped; exit; }
+cat <<EOF | $CC -o $t/a.o -c -xc - -fPIC
+#include <stdio.h>
 
-cat <<EOF | $CC -fPIC -shared -o $t/a.so -x assembler -
-.globl ext1, ext2
-ext1:
-  nop
-ext2:
-  nop
+void ignore(void *foo) {}
+
+void hello() {
+  printf("Hello world\n");
+}
 EOF
 
-cat <<EOF | $CC -c -o $t/b.o -x assembler -
-.globl _start
-_start:
-  call ext1@PLT
-  call ext2@PLT
-  mov ext2@GOTPCREL(%rip), %rax
-  ret
+$CC -B. -shared -o $t/b.so $t/a.o
+
+cat <<EOF | $CC -o $t/c.o -c -xc - -fPIC
+void ignore(void *);
+int hello();
+
+void foo() { ignore(hello); }
+
+int main() { hello(); }
 EOF
 
-./mold --pie -o $t/exe $t/b.o $t/a.so
-
-$OBJDUMP -d -j .plt.got $t/exe > $t/log
-
-grep -Eq '1020:.*jmp.* <ext2>' $t/log
-
-echo OK
+$CC -B. -o $t/exe $t/c.o $t/b.so
+$QEMU $t/exe | grep -q 'Hello world'

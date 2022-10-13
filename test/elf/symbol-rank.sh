@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 int a = 0;
@@ -52,5 +40,3 @@ ar rcs $t/x.a $t/a.o $t/b.o $t/c.o
 
 $CC -B. -o $t/exe $t/d.o $t/x.a
 $QEMU $t/exe | grep -q '^0 0 0 5$'
-
-echo OK

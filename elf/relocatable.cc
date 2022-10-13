@@ -71,7 +71,7 @@ public:
     this->name = ".symtab";
     this->out_shdr.sh_type = SHT_SYMTAB;
     this->out_shdr.sh_entsize = sizeof(ElfSym<E>);
-    this->out_shdr.sh_addralign = E::word_size;
+    this->out_shdr.sh_addralign = sizeof(Word<E>);
   }
 
   void add_local_symbol(Context<E> &ctx, RObjectFile<E> &file, i64 idx);
@@ -249,7 +249,7 @@ void RInputSection<E>::write_to(Context<E> &ctx) {
 
   switch (this->in_shdr.sh_type) {
   case SHT_GROUP: {
-    u32 *mem = (u32 *)(ctx.buf + this->out_shdr.sh_offset);
+    U32<E> *mem = (U32<E> *)(ctx.buf + this->out_shdr.sh_offset);
     for (i64 i = 1; i < this->out_shdr.sh_size / sizeof(u32); i++)
       mem[i] = file.sections[mem[i]]->shndx;
     break;
@@ -298,8 +298,8 @@ template <typename E>
 void ROutputEhdr<E>::write_to(Context<E> &ctx) {
   ElfEhdr<E> &hdr = *(ElfEhdr<E> *)(ctx.buf + this->out_shdr.sh_offset);
   memcpy(&hdr.e_ident, "\177ELF", 4);
-  hdr.e_ident[EI_CLASS] = (E::word_size == 8) ? ELFCLASS64 : ELFCLASS32;
-  hdr.e_ident[EI_DATA] = ELFDATA2LSB;
+  hdr.e_ident[EI_CLASS] = E::is_64 ? ELFCLASS64 : ELFCLASS32;
+  hdr.e_ident[EI_DATA] = E::is_le ? ELFDATA2LSB : ELFDATA2MSB;
   hdr.e_ident[EI_VERSION] = EV_CURRENT;
   hdr.e_type = ET_REL;
   hdr.e_machine = E::e_machine;
@@ -373,10 +373,10 @@ RObjectFile<E>::RObjectFile(Context<E> &ctx, MappedFile<Context<E>> &mf,
   // Read global symbols
   for (i64 i = first_global; i < syms.size(); i++) {
     std::string_view name = strtab + syms[i].st_name;
-    if (syms[i].is_defined())
-      defined_syms.insert(name);
-    else
+    if (syms[i].is_undef())
       undef_syms.insert(name);
+    else
+      defined_syms.insert(name);
   }
 }
 
@@ -398,7 +398,7 @@ void RObjectFile<E>::remove_comdats(Context<E> &ctx,
       continue;
 
     // If it is a duplicate, remove it and its members.
-    for (i64 j : this->template get_data<u32>(ctx, shdr).subspan(1))
+    for (i64 j : this->template get_data<U32<E>>(ctx, shdr).subspan(1))
       sections[j] = nullptr;
     sections[i] = nullptr;
   }
@@ -433,7 +433,9 @@ open_files(Context<E> &ctx, std::span<std::string> args) {
     }
 
     if (arg.starts_with("--version-script=") ||
-        arg.starts_with("--dynamic-list="))
+        arg.starts_with("--dynamic-list=") ||
+        arg.starts_with("--export-dynamic-symbol=") ||
+        arg.starts_with("--export-dynamic-symbol-list="))
       continue;
 
     MappedFile<Context<E>> *mf = nullptr;
@@ -586,9 +588,8 @@ void combine_objects(Context<E> &ctx, std::span<std::string> file_args) {
   out->close(ctx);
 }
 
-#define INSTANTIATE(E)                                                  \
-  template void combine_objects(Context<E> &, std::span<std::string>);
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void combine_objects(Context<E> &, std::span<std::string>);
 
 } // namespace mold::elf

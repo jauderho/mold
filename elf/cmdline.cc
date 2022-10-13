@@ -1,11 +1,18 @@
 #include "mold.h"
 #include "../cmdline.h"
 
+#include <regex>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 #include <unordered_set>
+
+#ifdef _WIN32
+# define _isatty isatty
+# define STDERR_FILENO (_fileno(stderr))
+#else
+# include <unistd.h>
+#endif
 
 namespace mold::elf {
 
@@ -54,6 +61,8 @@ Options:
   --Tdata                     Set address to .data
   --Ttext                     Set address to .text
   --allow-multiple-definition Allow multiple definitions
+  --apply-dynamic-relocs      Apply link-time values for dynamic relocations (defualt)
+    --no-apply-dynamic-relocs
   --as-needed                 Only set DT_NEEDED if used
     --no-as-needed
   --build-id [none,md5,sha1,sha256,uuid,HEXSTRING]
@@ -63,7 +72,7 @@ Options:
   --color-diagnostics=[auto,always,never]
                               Use colors in diagnostics
   --color-diagnostics         Alias for --color-diagnostics=always
-  --compress-debug-sections [none,zlib,zlib-gabi,zlib-gnu]
+  --compress-debug-sections [none,zlib,zlib-gabi,zstd]
                               Compress .debug_* sections
   --dc                        Ignored
   --dependency-file=FILE      Write Makefile-style dependency rules to FILE
@@ -73,11 +82,14 @@ Options:
   --enable-new-dtags          Emit DT_RUNPATH for --rpath (default)
     --disable-new-dtags       Emit DT_RPATH for --rpath
   --dp                        Ignored
-  --dynamic-list              Read a list of dynamic symbols
+  --dynamic-list              Read a list of dynamic symbols (implies -Bsymbolic)
   --eh-frame-hdr              Create .eh_frame_hdr section
     --no-eh-frame-hdr
   --enable-new-dtags          Ignored
   --exclude-libs LIB,LIB,..   Mark all symbols in given libraries hidden
+  --export-dynamic-symbol     Put symbols matching glob in the dynamic symbol table
+  --export-dynamic-symbol-list
+                              Read a list of dynamic symbols
   --fatal-warnings            Treat warnings as errors
     --no-fatal-warnings       Do not treat warnings as errors (default)
   --fini SYMBOL               Call SYMBOL at unload-time
@@ -103,12 +115,12 @@ Options:
   --perf                      Print performance statistics
   --pie, --pic-executable     Create a position independent executable
     --no-pie, --no-pic-executable
-  --pop-state                 Pop state of flags governing input file handling
+  --pop-state                 Restore state of flags governing input file handling
   --print-gc-sections         Print removed unreferenced sections
     --no-print-gc-sections
   --print-icf-sections        Print folded identical sections
     --no-print-icf-sections
-  --push-state                Pop state of flags governing input file handling
+  --push-state                Save state of flags governing input file handling
   --quick-exit                Use quick_exit to exit (default)
     --no-quick-exit
   --relax                     Optimize instructions (default)
@@ -181,8 +193,8 @@ Options:
     -z notext
     -z textoff
 
-mold: supported targets: elf32-i386 elf64-x86-64 elf64-littleaarch64
-mold: supported emulations: elf_i386 elf_x86_64 aarch64linux aarch64elf)";
+mold: supported targets: elf32-i386 elf64-x86-64 elf32-littlearm elf64-littleaarch64 elf32-littleriscv elf32-bigriscv elf64-littleriscv elf64-bigriscv elf64-powerpc elf64-powerpc elf64-powerpcle elf64-s390 elf64-sparc
+mold: supported emulations: elf_i386 elf_x86_64 armelf_linux_eabi aarch64linux aarch64elf elf32lriscv elf32briscv elf64lriscv elf64briscv elf64_s390 elf64_sparc)";
 
 static std::vector<std::string> add_dashes(std::string name) {
   // Single-letter option
@@ -201,11 +213,13 @@ static std::vector<std::string> add_dashes(std::string name) {
 
 template <typename E>
 static i64 parse_hex(Context<E> &ctx, std::string opt, std::string_view value) {
-  if (value.starts_with("0x") || value.starts_with("0X"))
-    value = value.substr(2);
-  if (value.find_first_not_of("0123456789abcdefABCDEF") != value.npos)
+  auto flags = std::regex_constants::optimize | std::regex_constants::ECMAScript;
+  static std::regex re(R"((?:0x|0X)?([0-9a-fA-F]+))", flags);
+
+  std::cmatch m;
+  if (!std::regex_match(value.data(), value.data() + value.size(), m, re))
     Fatal(ctx) << "option -" << opt << ": not a hexadecimal number";
-  return std::stoul(std::string(value), nullptr, 16);
+  return std::stoul(m[1], nullptr, 16);
 }
 
 template <typename E>
@@ -227,13 +241,11 @@ static i64 parse_number(Context<E> &ctx, std::string opt,
 }
 
 template <typename E>
-static std::vector<u8> parse_hex_build_id(Context<E> &ctx,
-                                          std::string_view arg) {
-  assert(arg.starts_with("0x") || arg.starts_with("0X"));
+static std::vector<u8> parse_hex_build_id(Context<E> &ctx, std::string_view arg) {
+  auto flags = std::regex_constants::optimize | std::regex_constants::ECMAScript;
+  static std::regex re(R"(0[xX]([0-9a-fA-F][0-9a-fA-F])+)", flags);
 
-  if (arg.size() % 2)
-    Fatal(ctx) << "invalid build-id: " << arg;
-  if (arg.substr(2).find_first_not_of("0123456789abcdefABCDEF") != arg.npos)
+  if (!std::regex_match(arg.begin(), arg.end(), re))
     Fatal(ctx) << "invalid build-id: " << arg;
 
   arg = arg.substr(2);
@@ -247,9 +259,9 @@ static std::vector<u8> parse_hex_build_id(Context<E> &ctx,
     return c - 'A' + 10;
   };
 
-  std::vector<u8> vec(arg.size() / 2);
-  for (i64 i = 0; i < vec.size(); i++)
-    vec[i] = (fn(arg[i * 2]) << 4) | fn(arg[i * 2 + 1]);
+  std::vector<u8> vec;
+  for (i64 i = 0; i < arg.size(); i += 2)
+    vec.push_back((fn(arg[i]) << 4) | fn(arg[i + 1]));
   return vec;
 }
 
@@ -317,28 +329,6 @@ parse_defsym_value(Context<E> &ctx, std::string_view s) {
   return get_symbol(ctx, s);
 }
 
-// Returns a PLT header size and a PLT entry size.
-template <typename E>
-static std::pair<i64, i64> get_plt_size(Context<E> &ctx) {
-  if constexpr (std::is_same_v<E, X86_64>) {
-    if (ctx.arg.z_now)
-      return {0, 8};
-    if (ctx.arg.z_ibtplt)
-      return {32, 16};
-    return {16, 16};
-  }
-
-  if constexpr (std::is_same_v<E, I386>)
-    return {16, 16};
-  if constexpr (std::is_same_v<E, ARM64>)
-    return {32, 16};
-  if constexpr (std::is_same_v<E, ARM32>)
-    return {32, 16};
-  if constexpr (std::is_same_v<E, RISCV64>)
-    return {32, 16};
-  unreachable();
-}
-
 template <typename E>
 std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::span<std::string_view> args = ctx.cmdline_args;
@@ -347,16 +337,22 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::vector<std::string> remaining;
   std::string_view arg;
 
-  ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
   ctx.page_size = E::page_size;
+  ctx.arg.color_diagnostics = isatty(STDERR_FILENO);
 
   bool version_shown = false;
   bool warn_shared_textrel = false;
 
   // RISC-V object files contains lots of local symbols, so by default
   // we discard them. This is compatible with GNU ld.
-  if constexpr (std::is_same_v<E, RISCV64>)
+  if constexpr (is_riscv<E>)
     ctx.arg.discard_locals = true;
+
+  // It looks like the SPARC's dynamic linker takes both RELA's r_addend
+  // and the value at the relocated place. So we don't want to write
+  // values to relocated places.
+  if (is_sparc<E>)
+    ctx.arg.apply_dynamic_relocs = false;
 
   auto read_arg = [&](std::string name) {
     for (std::string opt : add_dashes(name)) {
@@ -448,19 +444,36 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       exit(0);
     } else if (read_flag("V")) {
       SyncOut(ctx) << mold_version
-                   << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386";
+                   << "\n  Supported emulations:\n   elf_x86_64\n   elf_i386\n"
+                   << "   aarch64linux\n   armelf_linux_eabi\n   elf64lriscv\n"
+                   << "   elf64briscv\n   elf32lriscv\n   elf32briscv\n"
+                   << "   elf64ppc\n   elf64lppc\n   elf64_s390\n   elf64_sparc";
       version_shown = true;
     } else if (read_arg("m")) {
       if (arg == "elf_x86_64") {
-        ctx.arg.emulation = EM_X86_64;
+        ctx.arg.emulation = MachineType::X86_64;
       } else if (arg == "elf_i386") {
-        ctx.arg.emulation = EM_386;
+        ctx.arg.emulation = MachineType::I386;
       } else if (arg == "aarch64linux") {
-        ctx.arg.emulation = EM_AARCH64;
+        ctx.arg.emulation = MachineType::ARM64;
       } else if (arg == "armelf_linux_eabi") {
-        ctx.arg.emulation = EM_ARM;
+        ctx.arg.emulation = MachineType::ARM32;
       } else if (arg == "elf64lriscv") {
-        ctx.arg.emulation = EM_RISCV;
+        ctx.arg.emulation = MachineType::RV64LE;
+      } else if (arg == "elf64briscv") {
+        ctx.arg.emulation = MachineType::RV64BE;
+      } else if (arg == "elf32lriscv") {
+        ctx.arg.emulation = MachineType::RV32LE;
+      } else if (arg == "elf32briscv") {
+        ctx.arg.emulation = MachineType::RV32BE;
+      } else if (arg == "elf64ppc") {
+        ctx.arg.emulation = MachineType::PPC64V1;
+      } else if (arg == "elf64lppc") {
+        ctx.arg.emulation = MachineType::PPC64V2;
+      } else if (arg == "elf64_s390") {
+        ctx.arg.emulation = MachineType::S390X;
+      } else if (arg == "elf64_sparc") {
+        ctx.arg.emulation = MachineType::SPARC64;
       } else {
         Fatal(ctx) << "unknown -m argument: " << arg;
       }
@@ -581,6 +594,10 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.soname = arg;
     } else if (read_flag("allow-multiple-definition")) {
       ctx.arg.allow_multiple_definition = true;
+    } else if (read_flag("apply-dynamic-relocs")) {
+      ctx.arg.apply_dynamic_relocs = true;
+    } else if (read_flag("no-apply-dynamic-relocs")) {
+      ctx.arg.apply_dynamic_relocs = false;
     } else if (read_flag("trace")) {
       ctx.arg.trace = true;
     } else if (read_flag("eh-frame-hdr")) {
@@ -641,9 +658,9 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.enable_new_dtags = false;
     } else if (read_arg("compress-debug-sections")) {
       if (arg == "zlib" || arg == "zlib-gabi")
-        ctx.arg.compress_debug_sections = COMPRESS_GABI;
-      else if (arg == "zlib-gnu")
-        ctx.arg.compress_debug_sections = COMPRESS_GNU;
+        ctx.arg.compress_debug_sections = COMPRESS_ZLIB;
+      else if (arg == "zstd")
+        ctx.arg.compress_debug_sections = COMPRESS_ZSTD;
       else if (arg == "none")
         ctx.arg.compress_debug_sections = COMPRESS_NONE;
       else
@@ -717,9 +734,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.z_interpose = true;
     } else if (read_z_flag("ibt")) {
       ctx.arg.z_ibt = true;
-      ctx.arg.z_ibtplt = true;
     } else if (read_z_flag("ibtplt")) {
-      ctx.arg.z_ibtplt = true;
     } else if (read_z_flag("muldefs")) {
       ctx.arg.allow_multiple_definition = true;
     } else if (read_z_flag("keep-text-section-prefix")) {
@@ -814,7 +829,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("opt-remarks-format")) {
       ctx.arg.plugin_opt.push_back("opt-remarks-format=" + std::string(arg));
     } else if (read_arg("opt-remarks-hotness-threshold")) {
-      ctx.arg.plugin_opt.push_back("opt-remarks-hotness-threshold=" + std::string(arg));
+      ctx.arg.plugin_opt.push_back("opt-remarks-hotness-threshold=" +
+                                   std::string(arg));
     } else if (read_arg("opt-remarks-passes")) {
       ctx.arg.plugin_opt.push_back("opt-remarks-passes=" + std::string(arg));
     } else if (read_flag("opt-remarks-with_hotness")) {
@@ -826,7 +842,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.plugin_opt.push_back("O" + std::string(args[0].substr(7)));
       args = args.subspan(1);
     } else if (read_arg("lto-pseudo-probe-for-profiling")) {
-      ctx.arg.plugin_opt.push_back("pseudo-probe-for-profiling=" + std::string(arg));
+      ctx.arg.plugin_opt.push_back("pseudo-probe-for-profiling=" +
+                                   std::string(arg));
     } else if (read_arg("lto-sample-profile")) {
       ctx.arg.plugin_opt.push_back("sample-profile=" + std::string(arg));
     } else if (read_flag("save-temps")) {
@@ -838,7 +855,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("thinlto-index-only")) {
       ctx.arg.plugin_opt.push_back("thinlto-index-only");
     } else if (read_arg("thinlto-object-suffix-replace")) {
-      ctx.arg.plugin_opt.push_back("thinlto-object-suffix-replace=" + std::string(arg));
+      ctx.arg.plugin_opt.push_back("thinlto-object-suffix-replace=" +
+                                   std::string(arg));
     } else if (read_arg("thinlto-prefix-replace")) {
       ctx.arg.plugin_opt.push_back("thinlto-prefix-replace=" + std::string(arg));
     } else if (read_arg("thinlto-cache-dir")) {
@@ -907,15 +925,14 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_arg("format") || read_arg("b")) {
       if (arg == "binary")
         Fatal(ctx)
-          << "mold does not suppor `-b binary`. If you want to convert a binary"
-          << " file into an object file, use `objcopy -I binary -O default"
-          << " <input-file> <output-file.o>` instead.";
+          << "mold does not support `-b binary`. If you want to convert a"
+          << " binary file into an object file, use `objcopy -I binary -O"
+          << " default <input-file> <output-file.o>` instead.";
       Fatal(ctx) << "unknown command line option: -b " << arg;
     } else if (read_arg("auxiliary") || read_arg("f")) {
       ctx.arg.auxiliary.push_back(arg);
     } else if (read_arg("filter") || read_arg("F")) {
       ctx.arg.filter.push_back(arg);
-    } else if (read_flag("apply-dynamic-relocs")) {
     } else if (read_arg("O")) {
     } else if (read_flag("O0")) {
     } else if (read_flag("O1")) {
@@ -955,9 +972,21 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_z_arg("common-page-size")) {
     } else if (read_flag("no-keep-memory")) {
     } else if (read_arg("version-script")) {
+      // --version-script, --dynamic-list and --export-dynamic-symbol[-list]
+      // are treated as positional arguments even if they are actually not
+      // positional. This is because linker scripts (a positional argument)
+      // can also specify a version script, and it's better to consolidate
+      // parsing in read_input_files. In particular, version scripts can
+      // modify ctx.default_version which we initialize *after* parsing
+      // non-positional args, so the parsing cannot be done right here.
       remaining.push_back("--version-script=" + std::string(arg));
     } else if (read_arg("dynamic-list")) {
+      ctx.arg.Bsymbolic = true;
       remaining.push_back("--dynamic-list=" + std::string(arg));
+    } else if (read_arg("export-dynamic-symbol")) {
+      remaining.push_back("--export-dynamic-symbol=" + std::string(arg));
+    } else if (read_arg("export-dynamic-symbol-list")) {
+      remaining.push_back("--export-dynamic-symbol-list=" + std::string(arg));
     } else if (read_flag("as-needed")) {
       remaining.push_back("--as-needed");
     } else if (read_flag("no-as-needed")) {
@@ -980,6 +1009,11 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (args[0] == "-z" && args.size() >= 2) {
       Warn(ctx) << "unknown command line option: -z " << args[1];
       args = args.subspan(2);
+    } else if (args[0] == "-dynamic") {
+      Fatal(ctx) << "unknown command line option: -dynamic;"
+                 << " -dynamic is a macOS linker's option. If you are trying"
+                 << " to build a binary for an Apple platform, you need to use"
+                 << " ld64.mold instead of mold or ld.mold.";
     } else {
       if (args[0][0] == '-')
         Fatal(ctx) << "unknown command line option: " << args[0];
@@ -997,7 +1031,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     }
   }
 
-  // Remove redundant `/..` or `/.` from library paths.
+  // Clean library paths by removing redundant `/..` and `/.`
+  // so that they are easier to read in log messages.
   for (std::string &path : ctx.arg.library_paths)
     path = path_clean(path);
 
@@ -1021,6 +1056,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     if (!ctx.arg.auxiliary.empty())
       Fatal(ctx) << "-auxiliary may not be used without -shared";
   }
+
+  if (!ctx.arg.apply_dynamic_relocs && !is_rela<E>)
+    Fatal(ctx) << "--no-apply-dynamic-relocs may not be used on "
+               << E::machine_type;
+
+  if (is_sparc<E> && ctx.arg.apply_dynamic_relocs)
+    Fatal(ctx) << "--apply-dynamic-relocs may not be used on SPARC64";
 
   if (ctx.arg.thread_count == 0)
     ctx.arg.thread_count = get_default_thread_count();
@@ -1046,15 +1088,7 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   if (ctx.arg.shared && warn_shared_textrel)
     ctx.arg.warn_textrel = true;
 
-  std::tie(ctx.plt_hdr_size, ctx.plt_size) = get_plt_size(ctx);
-
   ctx.arg.undefined.push_back(ctx.arg.entry);
-
-  // TLSDESC relocs must be always relaxed for statically-linked
-  // executables even if -no-relax is given. It is because a
-  // statically-linked executable doesn't contain a tranpoline
-  // function needed for TLSDESC.
-  ctx.relax_tlsdesc = ctx.arg.is_static || (ctx.arg.relax && !ctx.arg.shared);
 
   // By default, mold tries to ovewrite to an output file if exists
   // because at least on Linux, writing to an existing file is much
@@ -1074,9 +1108,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   return remaining;
 }
 
-#define INSTANTIATE(E)                                                  \
-  template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template std::vector<std::string> parse_nonpositional_args(Context<E> &ctx);
 
 } // namespace mold::elf

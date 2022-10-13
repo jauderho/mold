@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -fPIC -c -o $t/a.o -xc -
 int foo() __attribute__((visibility("protected")));
@@ -40,8 +28,9 @@ int foo() {
   return 3;
 }
 
+int x = 5;
 int bar();
-void *baz();
+void *baz() { return &x; }
 
 int main() {
   printf("%d %d %d\n", foo(), bar(), baz == baz());
@@ -49,6 +38,4 @@ int main() {
 EOF
 
 $CC -B. -no-pie -o $t/exe $t/c.o $t/b.so
-$QEMU $t/exe | grep -q '3 4 0'
-
-echo OK
+$QEMU $t/exe 2> /dev/null | grep -q '3 4 0'

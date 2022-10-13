@@ -1,22 +1,10 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-[ "$CC" = cc ] || { echo skipped; exit; }
+[ "$CC" = cc ] || skip
 
 # ASAN doesn't work with LD_PRELOAD
-nm mold-wrapper.so | grep -Pq '__[at]san_init' && { echo skipped; exit; }
+nm mold-wrapper.so | grep -q '__[at]san_init' && skip
 
 cat <<'EOF' | $CC -xc -c -o $t/a.o -
 #include <stdio.h>
@@ -39,7 +27,8 @@ grep -q mold $t/log
 ./mold -run /usr/bin/ld.gold --version | grep -q mold
 
 rm -f $t/ld $t/ld.lld $t/ld.gold $t/foo.ld
-touch $t/ld $t/ld.lld $t/ld.gold $t/foo.ld
+touch $t/ld $t/ld.lld $t/ld.gold
+echo "#!/bin/sh" >$t/foo.ld
 chmod 755 $t/ld $t/ld.lld $t/ld.gold $t/foo.ld
 
 ./mold -run $t/ld --version | grep -q mold
@@ -61,8 +50,3 @@ chmod 755 $t/sh
 ./mold -run $t/sh $t/ld.lld --version | grep -q mold
 ./mold -run $t/sh $t/ld.gold --version | grep -q mold
 ./mold -run $t/sh $t/foo.ld --version | grep -q mold && false
-
-ln -sf mold $t/mold
-PATH="$t:$PATH" ./mold -run $t/sh ld --version | grep -q mold
-
-echo OK

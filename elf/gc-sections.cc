@@ -34,13 +34,6 @@ static void visit(Context<E> &ctx, InputSection<E> *isec,
                   tbb::feeder<InputSection<E> *> &feeder, i64 depth) {
   assert(isec->is_visited);
 
-  // A relocation can refer either a section fragment (i.e. a piece of
-  // string in a mergeable string section) or a symbol. Mark all
-  // section fragments as alive.
-  if (SectionFragmentRef<E> *refs = isec->rel_fragments.get())
-    for (i64 i = 0; refs[i].idx >= 0; i++)
-      refs[i].frag->is_alive.store(true, std::memory_order_relaxed);
-
   // If this is a text section, .eh_frame may contain records
   // describing how to handle exceptions for that function.
   // We want to keep associated .eh_frame records.
@@ -73,10 +66,9 @@ static void visit(Context<E> &ctx, InputSection<E> *isec,
 }
 
 template <typename E>
-static tbb::concurrent_vector<InputSection<E> *>
-collect_root_set(Context<E> &ctx) {
+static void collect_root_set(Context<E> &ctx,
+                             tbb::concurrent_vector<InputSection<E> *> &rootset) {
   Timer t(ctx, "collect_root_set");
-  tbb::concurrent_vector<InputSection<E> *> rootset;
 
   auto enqueue_section = [&](InputSection<E> *isec) {
     if (mark_section(isec))
@@ -136,8 +128,6 @@ collect_root_set(Context<E> &ctx) {
       for (const ElfRel<E> &rel : cie.get_rels())
         enqueue_symbol(file->symbols[rel.r_sym]);
   });
-
-  return rootset;
 }
 
 // Mark all reachable sections
@@ -191,14 +181,14 @@ void gc_sections(Context<E> &ctx) {
 
   mark_nonalloc_fragments(ctx);
 
-  tbb::concurrent_vector<InputSection<E> *> rootset = collect_root_set(ctx);
+  tbb::concurrent_vector<InputSection<E> *> rootset;
+  collect_root_set(ctx, rootset);
   mark(ctx, rootset);
   sweep(ctx);
 }
 
-#define INSTANTIATE(E)                                  \
-  template void gc_sections(Context<E> &ctx);
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void gc_sections(Context<E> &ctx);
 
 } // namespace mold::elf

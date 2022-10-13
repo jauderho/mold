@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 mkdir -p $t/foo
 
@@ -23,6 +11,4 @@ cat <<EOF > $t/b.script
 INPUT(a.o)
 EOF
 
-$CC -o $t/exe -L$t/foo $t/b.script
-
-echo OK
+$CC -B. -o $t/exe -L$t/foo $t/b.script

@@ -1,23 +1,18 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
+
+echo 'int main() {}' | $CC -flto -o /dev/null -xc - >& /dev/null \
+  || skip
 
 cat <<EOF | $CC -flto -c -fPIC -o $t/a.o -xc -
 void foo() {}
 EOF
 
 $CC -B. -shared -o $t/b.so -flto $t/a.o
-nm -D $t/b.so | grep -q 'T foo'
 
-echo OK
+if [ $MACHINE = ppc64 ]; then
+  # On PPC64V1, function symbol refers a function descriptor in .opd
+  nm -D $t/b.so | grep -q 'D foo'
+else
+  nm -D $t/b.so | grep -q 'T foo'
+fi

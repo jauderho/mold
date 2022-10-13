@@ -1,21 +1,8 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 # musl doesn't work with `-z noseparate-code`
-echo 'int main() {}' | $CC -o $t/exe -xc -
-readelf --dynamic $t/exe | grep -q ld-musl && { echo skipped; exit; }
+ldd --help 2>&1 | grep -q musl && skip
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 #include <stdio.h>
@@ -32,8 +19,3 @@ $QEMU $t/exe2 | grep -q 'Hello world'
 
 $CC -B. -o $t/exe3 $t/a.o -Wl,-z,noseparate-code -Wl,-z,norelro
 $QEMU $t/exe3 | grep -q 'Hello world'
-
-readelf --segments $t/exe3 > $t/log
-! grep 'LOAD .* RW ' $t/log || false
-
-echo OK

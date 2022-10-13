@@ -17,6 +17,11 @@
 
 namespace mold::macho {
 
+template <typename T, typename U>
+static void merge(std::set<T> &a, U &&b) {
+  a.insert(b.begin(), b.end());
+}
+
 static std::vector<YamlNode>
 get_vector(YamlNode &node, std::string_view key) {
   if (auto *map = std::get_if<std::map<std::string_view, YamlNode>>(&node.data))
@@ -52,11 +57,25 @@ static bool contains(const std::vector<YamlNode> &vec, std::string_view key) {
   return false;
 }
 
+static bool match_arch(const std::vector<YamlNode> &vec, std::string_view arch) {
+  for (const YamlNode &mem : vec)
+    if (auto val = std::get_if<std::string_view>(&mem.data))
+      if (*val == arch || val->starts_with(std::string(arch) + "-"))
+        return true;
+  return false;
+}
+
 template <typename E>
 static std::optional<TextDylib>
-to_tbd(Context<E> &ctx, YamlNode &node, std::string_view arch) {
-  if (!contains(get_vector(node, "targets"), arch))
+to_tbd(Context<E> &ctx, YamlNode &node, std::string_view arch,
+       std::string_view filename) {
+  if (!match_arch(get_vector(node, "targets"), arch))
     return {};
+
+  if (ctx.arg.application_extension &&
+      contains(get_vector(node, "flags"), "not_app_extension_safe"))
+    Warn(ctx) << "linking against a dylib which is not safe for use in "
+              << "application extensions: " << filename;
 
   TextDylib tbd;
 
@@ -64,7 +83,7 @@ to_tbd(Context<E> &ctx, YamlNode &node, std::string_view arch) {
     tbd.install_name = *val;
 
   for (YamlNode &mem : get_vector(node, "reexported-libraries"))
-    if (contains(get_vector(mem, "targets"), arch))
+    if (match_arch(get_vector(mem, "targets"), arch))
       append(tbd.reexported_libs, get_string_vector(mem, "libraries"));
 
   auto concat = [&](const std::string &x, std::string_view y) {
@@ -73,20 +92,20 @@ to_tbd(Context<E> &ctx, YamlNode &node, std::string_view arch) {
 
   for (std::string_view key : {"exports", "reexports"}) {
     for (YamlNode &mem : get_vector(node, key)) {
-      if (contains(get_vector(mem, "targets"), arch)) {
-        append(tbd.exports, get_string_vector(mem, "symbols"));
-        append(tbd.weak_exports, get_string_vector(mem, "weak-symbols"));
+      if (match_arch(get_vector(mem, "targets"), arch)) {
+        merge(tbd.exports, get_string_vector(mem, "symbols"));
+        merge(tbd.weak_exports, get_string_vector(mem, "weak-symbols"));
 
         for (std::string_view s : get_string_vector(mem, "objc-classes")) {
-          tbd.exports.push_back(concat("_OBJC_CLASS_$_", s));
-          tbd.exports.push_back(concat("_OBJC_METACLASS_$_", s));
+          tbd.exports.insert(concat("_OBJC_CLASS_$_", s));
+          tbd.exports.insert(concat("_OBJC_METACLASS_$_", s));
         }
 
         for (std::string_view s : get_string_vector(mem, "objc-eh-types"))
-          tbd.exports.push_back(concat("_OBJC_EHTYPE_$_", s));
+          tbd.exports.insert(concat("_OBJC_EHTYPE_$_", s));
 
         for (std::string_view s : get_string_vector(mem, "objc-ivars"))
-          tbd.exports.push_back(concat("_OBJC_IVAR_$_", s));
+          tbd.exports.insert(concat("_OBJC_IVAR_$_", s));
       }
     }
   }
@@ -99,7 +118,7 @@ static i64 parse_version(const std::string &arg) {
   static std::regex re(R"((\d+)(?:\.(\d+))?(?:\.(\d+))?)", flags);
 
   std::smatch m;
-  bool ok = std::regex_match(arg, m, re);
+  [[maybe_unused]] bool ok = std::regex_match(arg, m, re);
   assert(ok);
 
   i64 major = (m[1].length() == 0) ? 0 : stoi(m[1]);
@@ -113,9 +132,7 @@ static i64 parse_version(const std::string &arg) {
 // We interpret such symbols in this function.
 template <typename E>
 static void interpret_ld_symbols(Context<E> &ctx, TextDylib &tbd) {
-  std::vector<std::string_view> syms;
-  syms.reserve(tbd.exports.size());
-
+  std::set<std::string_view> syms;
   std::unordered_set<std::string_view> hidden_syms;
 
   auto string_view = [](const std::csub_match &sub) {
@@ -135,7 +152,7 @@ static void interpret_ld_symbols(Context<E> &ctx, TextDylib &tbd) {
       R"(\$ld\$previous\$([^$]+)\$([\d.]*)\$(\d+)\$([\d.]+)\$([\d.]+)\$(.*)\$)",
       flags);
 
-    if (std::regex_match(s.begin(), s.end(), m, previous_re)) {
+    if (std::regex_match(s.data(), s.data() + s.size(), m, previous_re)) {
       std::string_view install_name = string_view(m[1]);
       i64 platform = std::stoi(m[3].str());
       i64 min_version = parse_version(m[4]);
@@ -162,9 +179,9 @@ static void interpret_ld_symbols(Context<E> &ctx, TextDylib &tbd) {
     // matches.
     static std::regex add_re(R"(\$ld\$add\$os([\d.]+)\$(.+))", flags);
 
-    if (std::regex_match(s.begin(), s.end(), m, add_re)) {
+    if (std::regex_match(s.data(), s.data() + s.size(), m, add_re)) {
       if (ctx.arg.platform_min_version == parse_version(m[1]))
-        syms.push_back(string_view(m[2]));
+        syms.insert(string_view(m[2]));
       continue;
     }
 
@@ -172,7 +189,7 @@ static void interpret_ld_symbols(Context<E> &ctx, TextDylib &tbd) {
     // matches.
     static std::regex hidden_re(R"(\$ld\$hide\$os([\d.]+)\$(.+))", flags);
 
-    if (std::regex_match(s.begin(), s.end(), m, hidden_re)) {
+    if (std::regex_match(s.data(), s.data() + s.size(), m, hidden_re)) {
       if (ctx.arg.platform_min_version == parse_version(m[1]))
         hidden_syms.insert(string_view(m[2]));
       continue;
@@ -183,7 +200,7 @@ static void interpret_ld_symbols(Context<E> &ctx, TextDylib &tbd) {
     static std::regex
       install_name_re(R"(\$ld\$install_name\$os([\d.]+)\$(.+))", flags);
 
-    if (std::regex_match(s.begin(), s.end(), m, install_name_re)) {
+    if (std::regex_match(s.data(), s.data() + s.size(), m, install_name_re)) {
       if (ctx.arg.platform_min_version == parse_version(m[1]))
         tbd.install_name = string_view(m[2]);
       continue;
@@ -191,45 +208,15 @@ static void interpret_ld_symbols(Context<E> &ctx, TextDylib &tbd) {
   }
 
   for (std::string_view s : tbd.exports)
-    if (!s.starts_with("$ld$") && !hidden_syms.contains(std::string(s)))
-      syms.push_back(s);
+    if (!s.starts_with("$ld$") && !hidden_syms.contains(s))
+      syms.insert(s);
 
-  std::erase_if(syms, [](std::string_view s) { return s.starts_with("$ld$"); });
-  tbd.exports = syms;
+  tbd.exports = std::move(syms);
 }
 
 template <typename E>
 static TextDylib parse(Context<E> &ctx, MappedFile<Context<E>> *mf,
                        std::string_view arch);
-
-template <typename E>
-static MappedFile<Context<E>> *
-find_external_lib(Context<E> &ctx, std::string_view parent, std::string path) {
-  if (!path.starts_with('/'))
-    Fatal(ctx) << parent << ": contains an invalid reexported path: " << path;
-
-  for (const std::string &root : ctx.arg.syslibroot) {
-    if (path.ends_with(".tbd")) {
-      if (auto *file = MappedFile<Context<E>>::open(ctx, root + path))
-        return file;
-      continue;
-    }
-
-    if (path.ends_with(".dylib")) {
-      std::string stem(path.substr(0, path.size() - 6));
-      if (auto *file = MappedFile<Context<E>>::open(ctx, root + stem + ".tbd"))
-        return file;
-      if (auto *file = MappedFile<Context<E>>::open(ctx, root + path))
-        return file;
-    }
-
-    for (std::string extn : {".tbd", ".dylib"})
-      if (auto *file = MappedFile<Context<E>>::open(ctx, root + path + extn))
-        return file;
-  }
-
-  Fatal(ctx) << parent << ": cannot open reexported library " << path;
-}
 
 // A single YAML file may contain multiple text dylibs. The first text
 // dylib is the main file followed by optional other text dylibs for
@@ -241,6 +228,7 @@ template <typename E>
 static TextDylib
 squash(Context<E> &ctx, std::span<TextDylib> tbds, std::string_view arch) {
   std::unordered_map<std::string_view, TextDylib> map;
+  std::vector<std::string_view> remainings;
 
   TextDylib main = std::move(tbds[0]);
   for (TextDylib &tbd : tbds.subspan(1))
@@ -251,28 +239,18 @@ squash(Context<E> &ctx, std::span<TextDylib> tbds, std::string_view arch) {
       auto it = map.find(lib);
 
       if (it != map.end()) {
-        // The referenced reexported library is in the same .tbd file.
         TextDylib &child = it->second;
-        append(main.exports, child.exports);
-        append(main.weak_exports, child.weak_exports);
+        merge(main.exports, child.exports);
+        merge(main.weak_exports, child.weak_exports);
         visit(child);
       } else {
-        // The referenced reexported library is a separate file.
-        MappedFile<Context<E>> *mf =
-          find_external_lib(ctx, tbd.install_name, std::string(lib));
-        TextDylib child = parse(ctx, mf, arch);
-        append(main.exports, child.exports);
-        append(main.weak_exports, child.weak_exports);
+        remainings.push_back(lib);
       }
     }
   };
 
   visit(main);
-
-  sort(main.exports);
-  sort(main.weak_exports);
-  remove_duplicates(main.exports);
-  remove_duplicates(main.weak_exports);
+  main.reexported_libs = remainings;
   return main;
 }
 
@@ -294,7 +272,7 @@ static TextDylib parse(Context<E> &ctx, MappedFile<Context<E>> *mf,
 
   std::vector<TextDylib> vec;
   for (YamlNode &node : nodes)
-    if (std::optional<TextDylib> dylib = to_tbd(ctx, node, arch))
+    if (std::optional<TextDylib> dylib = to_tbd(ctx, node, arch, mf->name))
       vec.push_back(*dylib);
 
   for (TextDylib &tbd : vec)
@@ -303,14 +281,17 @@ static TextDylib parse(Context<E> &ctx, MappedFile<Context<E>> *mf,
   return squash(ctx, vec, arch);
 }
 
-template <>
-TextDylib parse_tbd(Context<ARM64> &ctx, MappedFile<Context<ARM64>> *mf) {
-  return parse(ctx, mf, "arm64-macos");
+template <typename E>
+TextDylib parse_tbd(Context<E> &ctx, MappedFile<Context<E>> *mf) {
+  if constexpr (std::is_same_v<E, ARM64>)
+    return parse(ctx, mf, "arm64");
+  if constexpr (std::is_same_v<E, X86_64>)
+    return parse(ctx, mf, "x86_64");
+  unreachable();
 }
 
-template <>
-TextDylib parse_tbd(Context<X86_64> &ctx, MappedFile<Context<X86_64>> *mf) {
-  return parse(ctx, mf, "x86_64-macos");
-}
+using E = MOLD_TARGET;
+
+template TextDylib parse_tbd(Context<E> &, MappedFile<Context<E>> *);
 
 } // namespace mold::macho

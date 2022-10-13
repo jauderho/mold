@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../inttypes.h"
+
 namespace mold {
 
 enum PluginStatus {
@@ -44,6 +46,7 @@ enum PluginTag {
   LDPT_REGISTER_NEW_INPUT_HOOK,
   LDPT_GET_WRAP_SYMBOLS,
   LDPT_ADD_SYMBOLS_V2,
+  LDPT_GET_API_VERSION,
 };
 
 enum PluginApiVersion {
@@ -72,27 +75,35 @@ enum PluginOutputFileType {
 
 struct PluginInputFile {
   const char *name;
-  int32_t fd;
-  uint64_t offset;
-  uint64_t filesize;
+  i32 fd;
+  u64 offset;
+  u64 filesize;
   void *handle;
 };
 
 struct PluginSection {
   const void *handle;
-  uint32_t shndx;
+  u32 shndx;
 };
 
 struct PluginSymbol {
   char *name;
   char *version;
-  char def;
-  char symbol_type;
-  char section_kind;
-  int32_t visibility;
-  uint64_t size;
+#ifdef __LITTLE_ENDIAN__
+  u8 def;
+  u8 symbol_type;
+  u8 section_kind;
+  u8 padding;
+#else
+  u8 padding;
+  u8 section_kind;
+  u8 symbol_type;
+  u8 def;
+#endif
+  i32 visibility;
+  u64 size;
   char *comdat_key;
-  int32_t resolution;
+  i32 resolution;
 };
 
 enum PluginSymbolKind {
@@ -139,6 +150,11 @@ enum PluginLevel {
   LDPL_WARNING,
   LDPL_ERROR,
   LDPL_FATAL,
+};
+
+enum PluginLinkerAPIVersion {
+  LAPI_V0 = 0,
+  LAPI_V1,
 };
 
 typedef PluginStatus OnloadFn(PluginTagValue *tv);

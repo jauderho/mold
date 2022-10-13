@@ -86,13 +86,6 @@ template<> struct hash<Digest> {
     return *(int64_t *)&k[0];
   }
 };
-
-std::string to_string(Digest digest) {
-  char buf[HASH_SIZE * 2];
-  for (int i = 0; i < HASH_SIZE; i++)
-    sprintf(buf + i * 2, "%02x", digest[i]);
-  return {buf, sizeof(buf)};
-}
 }
 
 namespace mold::elf {
@@ -139,10 +132,9 @@ static bool is_eligible(Context<E> &ctx, InputSection<E> &isec) {
          !is_init && !is_fini && !is_enumerable && !is_addr_taken;
 }
 
-static Digest digest_final(SHA256_CTX &sha) {
+static Digest digest_final(SHA256Hash &sha) {
   u8 buf[SHA256_SIZE];
-  int res = SHA256_Final(buf, &sha);
-  assert(res == 1);
+  sha.finish(buf);
 
   Digest digest;
   memcpy(digest.data(), buf, HASH_SIZE);
@@ -246,16 +238,15 @@ static void merge_leaf_nodes(Context<E> &ctx) {
 
 template <typename E>
 static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
-  SHA256_CTX sha;
-  SHA256_Init(&sha);
+  SHA256Hash sha;
 
   auto hash = [&](auto val) {
-    SHA256_Update(&sha, &val, sizeof(val));
+    sha.update((u8 *)&val, sizeof(val));
   };
 
   auto hash_string = [&](std::string_view str) {
     hash(str.size());
-    SHA256_Update(&sha, str.data(), str.size());
+    sha.update((u8 *)str.data(), str.size());
   };
 
   auto hash_symbol = [&](Symbol<E> &sym) {
@@ -303,22 +294,12 @@ static Digest compute_digest(Context<E> &ctx, InputSection<E> &isec) {
     }
   }
 
-  i64 frag_idx = 0;
-
   for (i64 i = 0; i < isec.get_rels(ctx).size(); i++) {
     const ElfRel<E> &rel = isec.get_rels(ctx)[i];
     hash(rel.r_offset);
     hash(rel.r_type);
     hash(isec.get_addend(rel));
-
-    if (isec.rel_fragments && isec.rel_fragments[frag_idx].idx == i) {
-      SectionFragmentRef<E> &ref = isec.rel_fragments[frag_idx++];
-      hash('a');
-      isec.get_addend(rel);
-      hash((u64)ref.frag);
-    } else {
-      hash_symbol(*isec.file.symbols[rel.r_sym]);
-    }
+    hash_symbol(*isec.file.symbols[rel.r_sym]);
   }
 
   return digest_final(sha);
@@ -390,19 +371,14 @@ static void gather_edges(Context<E> &ctx,
   tbb::parallel_for((i64)0, (i64)sections.size(), [&](i64 i) {
     InputSection<E> &isec = *sections[i];
     assert(isec.icf_eligible);
-    i64 frag_idx = 0;
 
     for (i64 j = 0; j < isec.get_rels(ctx).size(); j++) {
-      if (isec.rel_fragments && isec.rel_fragments[frag_idx].idx == j) {
-        frag_idx++;
-      } else {
-        const ElfRel<E> &rel = isec.get_rels(ctx)[j];
-        Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-        if (!sym.get_frag())
-          if (InputSection<E> *isec = sym.get_input_section())
-            if (isec->icf_eligible)
-              num_edges[i]++;
-      }
+      const ElfRel<E> &rel = isec.get_rels(ctx)[j];
+      Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+      if (!sym.get_frag())
+        if (InputSection<E> *isec = sym.get_input_section())
+          if (isec->icf_eligible)
+            num_edges[i]++;
     }
   });
 
@@ -413,20 +389,15 @@ static void gather_edges(Context<E> &ctx,
 
   tbb::parallel_for((i64)0, (i64)num_edges.size(), [&](i64 i) {
     InputSection<E> &isec = *sections[i];
-    i64 frag_idx = 0;
     i64 idx = edge_indices[i];
 
     for (i64 j = 0; j < isec.get_rels(ctx).size(); j++) {
-      if (isec.rel_fragments && isec.rel_fragments[frag_idx].idx == j) {
-        frag_idx++;
-      } else {
-        const ElfRel<E> &rel = isec.get_rels(ctx)[j];
-        Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
-        if (!sym.get_frag())
-          if (InputSection<E> *isec = sym.get_input_section())
-            if (isec->icf_eligible)
-              edges[idx++] = isec->icf_idx;
-      }
+      const ElfRel<E> &rel = isec.get_rels(ctx)[j];
+      Symbol<E> &sym = *isec.file.symbols[rel.r_sym];
+      if (!sym.get_frag())
+        if (InputSection<E> *isec = sym.get_input_section())
+          if (isec->icf_eligible)
+            edges[idx++] = isec->icf_idx;
     }
   });
 }
@@ -445,15 +416,15 @@ static i64 propagate(std::span<std::vector<Digest>> digests,
     if (digests[slot][i] == digests[!slot][i])
       return;
 
-    SHA256_CTX sha;
-    SHA256_Init(&sha);
-    SHA256_Update(&sha, digests[2][i].data(), HASH_SIZE);
+    SHA256Hash sha;
+    sha.update(digests[2][i].data(), HASH_SIZE);
 
     i64 begin = edge_indices[i];
     i64 end = (i + 1 == num_digests) ? edges.size() : edge_indices[i + 1];
 
-    for (i64 j : edges.subspan(begin, end - begin))
-      SHA256_Update(&sha, digests[slot][j].data(), HASH_SIZE);
+    for (i64 j : edges.subspan(begin, end - begin)) {
+      sha.update(digests[slot][j].data(), HASH_SIZE);
+    }
 
     digests[!slot][i] = digest_final(sha);
 
@@ -632,9 +603,8 @@ void icf_sections(Context<E> &ctx) {
   }
 }
 
-#define INSTANTIATE(E)                          \
-  template void icf_sections(Context<E> &ctx);
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void icf_sections(Context<E> &ctx);
 
 } // namespace mold::elf

@@ -1,19 +1,7 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-which dwarfdump >& /dev/null || { echo skipped; exit; }
+command -v dwarfdump >& /dev/null || skip
 
 cat <<EOF | $CXX -c -o $t/a.o -g -gz=zlib -xc++ -
 int main() {
@@ -29,6 +17,4 @@ EOF
 
 $CC -B. -o $t/exe $t/a.o $t/b.o
 dwarfdump $t/exe > /dev/null
-readelf --sections $t/exe | fgrep -q .debug_info
-
-echo ' OK'
+readelf --sections $t/exe | grep -Fq .debug_info

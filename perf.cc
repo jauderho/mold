@@ -3,8 +3,11 @@
 #include <functional>
 #include <iomanip>
 #include <ios>
+
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/time.h>
+#endif
 
 namespace mold {
 
@@ -23,24 +26,39 @@ void Counter::print() {
 }
 
 static i64 now_nsec() {
+#ifdef _WIN32
+  return (i64)std::chrono::steady_clock::now().time_since_epoch().count();
+#else
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return (i64)t.tv_sec * 1000000000 + t.tv_nsec;
+#endif
 }
 
-static i64 to_nsec(struct timeval t) {
-  return (i64)t.tv_sec * 1000000000 + t.tv_usec * 1000;
+static std::pair<i64, i64> get_usage() {
+#ifdef _WIN32
+  auto to_nsec = [](FILETIME t) -> i64 {
+    return ((u64)t.dwHighDateTime << 32 + (u64)t.dwLowDateTime) * 100;
+  };
+
+  FILETIME creation, exit, kernel, user;
+  GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
+  return {to_nsec(user), to_nsec(kernel)};
+#else
+  auto to_nsec = [](struct timeval t) -> i64 {
+    return (i64)t.tv_sec * 1000000000 + t.tv_usec * 1000;
+  };
+
+  struct rusage ru;
+  getrusage(RUSAGE_SELF, &ru);
+  return {to_nsec(ru.ru_utime), to_nsec(ru.ru_stime)};
+#endif
 }
 
 TimerRecord::TimerRecord(std::string name, TimerRecord *parent)
   : name(name), parent(parent) {
-  struct rusage usage;
-  getrusage(RUSAGE_SELF, &usage);
-
   start = now_nsec();
-  user = to_nsec(usage.ru_utime);
-  sys = to_nsec(usage.ru_stime);
-
+  std::tie(user, sys) = get_usage();
   if (parent)
     parent->children.push_back(this);
 }
@@ -50,12 +68,13 @@ void TimerRecord::stop() {
     return;
   stopped = true;
 
-  struct rusage usage;
-  getrusage(RUSAGE_SELF, &usage);
+  i64 user2;
+  i64 sys2;
+  std::tie(user2, sys2) = get_usage();
 
   end = now_nsec();
-  user = to_nsec(usage.ru_utime) - user;
-  sys = to_nsec(usage.ru_stime) - sys;
+  user = user2 - user;
+  sys = sys2 - sys;
 }
 
 static void print_rec(TimerRecord &rec, i64 indent) {

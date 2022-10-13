@@ -229,7 +229,47 @@ such as system-dependent library search paths, are hard-coded.
 depends only on its command-line arguments.
 .
 .\"=============================================================================
-.Sh OPTIONS
+.Sh MOLD-SPECIFIC OPTIONS
+.Bl -tag -width 6n -compact
+.It Fl -reverse-sections
+Reverses the order of input sections before assigning them the offsets \
+in the output file.
+.Pp
+This option is useful for finding a bug that depends on an initialization \
+order of global objects. In C++, constructors of global objects in a single \
+ source file are guaranteed to be executed in the source order, but \
+there's no such guarantee across compilation units. Usually, constructors \
+are executed in the order given to the linker, but depending on it is a mistake.
+.Pp
+By reversing the order of input sections using
+.Fl -reverse-sections ,
+you can easily test that your program works in the reversed initialization order.
+.Pp
+.It Fl -shuffle-sections
+.It Fl -shuffle-sections Ns = Ns Ar number
+Randomizes the output by shuffleing the order of input sections before \
+assigning them the offsets in the output file. If
+.Ar number
+is given, it's used as a seed for the random number generator, so that \
+the linker produces the same output as for the same seed. If no seed \
+is given, it uses a random number as a seed.
+.Pp
+This option is useful for benchmarking. Modern CPUs are sensitive to program's \
+memory layout. A seeming benign change in program layout (such as a small \
+size increase of a function) can affect program's performance. Therefore, \
+even if you write new code and get a good benchmark result, it is hard \
+to say whether or not the new code improves the programs performance; \
+it is possible that the a program's layout happens to perform better.
+.Pp
+By running a benchmark multiple time with shuffling program's layout using
+.Fl -shuffle-sections ,
+you can isolate your progrma's real performace number from the randomness \
+caused by memory layout changes.
+.
+.El \" End of options list
+.
+.\"-----------------------------------------------------------------------------
+.Sh GNU-COMPATIBLE OPTIONS
 .Bl -tag -width 6n -compact
 .It Fl -help
 Report usage information to stdout and exit.
@@ -352,7 +392,7 @@ or
 .Pf Sy lib Ar libname Ns Sy \.a
 from library search paths.
 .Pp
-.It Fl m Op Sy elf_x86_64 | elf_i386 | aarch64linux
+.It Fl m Op Ar target
 Choose a target.
 .Pp
 .It Fl o Ar file , Fl -output Ns = Ns Ar file
@@ -487,10 +527,13 @@ Default is
 .Pp
 .It Fl -defsym Ns = Ns Ar symbol Ns = Ns Ar value
 .Pp
-.It Fl -compress-debug-sections Ns = Ns Op Sy none | zlib | zlib-gabi | zlib-gnu
+.It Fl -compress-debug-sections Ns = Ns Op Sy none | zlib | zlib-gabi | zstd
 Compress DWARF debug info
 .Pf ( Sy .debug_*
-sections) using the zlib compression algorithm.
+sections) using the zlib or zstd compression algorithm.
+.Fl zlib-gabi
+is an alias for
+.Fl zlib .
 .Pp
 .It Fl -defsym Ns = Ns Ar symbol Ns = Ns Ar value
 Define
@@ -529,6 +572,10 @@ options.
 .It Fl -dynamic-list Ns = Ns Ar file
 Read a list of dynamic symbols from
 .Ar file .
+Same as
+.Fl -export-dynamic-symbol-list ,
+except that it implies
+.Fl -Bsymbolic .
 .Pp
 .It Fl -eh-frame-hdr
 .It Fl -no-eh-frame-hdr
@@ -568,6 +615,20 @@ instead.
 Mark all symbols in the given
 .Ar libraries
 hidden.
+.Pp
+.It Fl -export-dynamic-symbol Ns = Ns Ar sym
+Put symbols matching
+.Ar sym
+in the dynamic symbol table.
+.Ar sym
+may be a glob, with the same syntax as the globs used in
+.Fl -export-dynamic-symbol-list
+or
+.Fl -version-script .
+.Pp
+.It Fl -export-dynamic-symbol-list Ns = Ns Ar file
+Read a list of dynamic symbols from
+.Ar file .
 .Pp
 .It Fl -fatal-warnings
 .It Fl -no-fatal-warnings
@@ -639,8 +700,8 @@ with something else without taking an address of a function.
 needs to be used with a compiler that supports
 .Sy .llvm_addrsig
 section which contains the information as to what symbols are address-taken. \
-LLVM/Clang supports that section by default. Since GCC does not suppor it yet, \
-you cannot use
+LLVM/Clang supports that section by default. Since GCC does not support it \
+yet, you cannot use
 .Fl -icf=safe
 with GCC (it doesn't do any harm but can't optimize at all.)
 .Pp
@@ -693,7 +754,7 @@ to run executables or shared libraries linked with
 .Fl -pack-dyn-relocs=relr ,
 and only ChromeOS, Android and Fuchsia support it as of now in 2022.
 .Pp
-.It -package-metadata Ns = Ns string
+.It Fl -package-metadata Ns = Ns Ar string
 Embed
 .Ar string
 to a .note.package section. This option in intended to be used by a \
@@ -782,10 +843,6 @@ section and does not affect
 .Dv .dynsym
 section, which is used for dynamic linking.
 .Pp
-.It Fl -reverse-sections
-Reverses the order of input sections before assigning them the offsets \
-in the output file.
-.Pp
 .It Fl -rpath Ns = Ns Ar dir
 Add
 .Ar dir
@@ -810,15 +867,6 @@ is a hexadecimal number that may start with an optional
 .Pp
 .It Fl -shared , -Bshareable
 Create a share library.
-.Pp
-.It Fl -shuffle-sections
-.It Fl -shuffle-sections Ns = Ns Ar number
-Randomizes the output by shuffleing the order of input sections before \
-assigning them the offsets in the output file. If
-.Ar number
-is given, it's used as a seed for the random number generator, so that \
-the linker produces the same output as for the same seed. If no seed \
-is given, it uses a random number as a seed.
 .Pp
 .It Fl -spare-dynamic-tags Ns = Ns Ar number
 Reserve given
@@ -979,23 +1027,7 @@ section to indicate that the output uses IBT-enabled PLT. This option implies
 .Fl z Cm ibtplt .
 .Pp
 .It Fl z Cm ibtplt
-Generate Intel Branch Tracking (IBT)-enabled PLT.
-.Pp
-IBT is part of Intel Control-flow Enforcement Technology (CET).
-IBT is a new x86 feature available since Tiger Lake which is released in 2020.
-If IBT is enabled, all indirect branch instructions have to branch to a \
-so-called "landing pad" instruction. Landing pad itself is a no-op, but \
-it works as a marker that branching to that instruction is expected.
-If there's no landing pad after branch, the CPU raises an exception.
-This mechanism makes ROP attacks difficult.
-.Pp
-Since PLT can be used as an indirect branch target, we need a different \
-instruction sequence for IBT-enabled PLT. If
-.Sy -z Cm ibtplt
-is specified,
-.Nm
-generates PLT entries that start with a landing pad. The size of IBT-enabled \
-PLT is 24 bytes as opposed to 16 bytes regular PLT.
+Generate Intel Branch Tracking (IBT)-enabled PLT which is the default on x86-64.
 .Pp
 .It Fl z Cm execstack
 .It Fl z Cm noexecstack
@@ -1029,15 +1061,13 @@ As a security mitigation,
 it is preferred to make such segments read-only during program execution.
 .Pp
 .Fl z Cm relro
-puts such sections into a special section called
+puts such sections into a special segment called
 .Dv relro .
 The dynamic linker make a relro segment read-only after it finishes its job.
 .Pp
 By default,
 .Nm
-generates a
-.Sy relro
-segment.
+generates a relro segment.
 .Fl z Cm norelro
 disables the feature.
 .Pp

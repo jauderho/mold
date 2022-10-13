@@ -16,8 +16,7 @@ void StubsSection<E>::copy_buf(Context<E> &ctx) {
     buf[i * 6] = 0xff;
     buf[i * 6 + 1] = 0x25;
     *(ul32 *)(buf + i * 6 + 2) =
-      ctx.lazy_symbol_ptr.hdr.addr + i * E::word_size -
-      (this->hdr.addr + i * 6 + 6);
+      ctx.lazy_symbol_ptr.hdr.addr + i * word_size - (this->hdr.addr + i * 6 + 6);
   }
 }
 
@@ -79,45 +78,6 @@ static i64 read_addend(u8 *buf, const MachRel &r) {
   unreachable();
 }
 
-static Relocation<E>
-read_reloc(Context<E> &ctx, ObjectFile<E> &file,
-           const MachSection &hdr, MachRel &r) {
-  if (r.p2size != 2 && r.p2size != 3)
-    Fatal(ctx) << file << ": invalid r.p2size: " << (u32)r.p2size;
-
-  if (r.is_pcrel) {
-    if (r.p2size != 2)
-      Fatal(ctx) << file << ": invalid PC-relative reloc: " << r.offset;
-  } else {
-    if (r.p2size != 3)
-      Fatal(ctx) << file << ": invalid non-PC-relative reloc: " << r.offset;
-  }
-
-  u8 *buf = (u8 *)file.mf->data + hdr.offset;
-  Relocation<E> rel{r.offset, (u8)r.type, (u8)r.p2size, (bool)r.is_pcrel};
-  i64 addend = read_addend(buf, r);
-
-  if (r.is_extern) {
-    rel.sym = file.syms[r.idx];
-    rel.addend = addend;
-    return rel;
-  }
-
-  u32 addr;
-  if (r.is_pcrel)
-    addr = hdr.addr + r.offset + 4 + addend;
-  else
-    addr = addend;
-
-  Subsection<E> *target = file.find_subsection(ctx, addr);
-  if (!target)
-    Fatal(ctx) << file << ": bad relocation: " << r.offset;
-
-  rel.subsec = target;
-  rel.addend = addr - target->input_addr;
-  return rel;
-}
-
 template <>
 std::vector<Relocation<E>>
 read_relocations(Context<E> &ctx, ObjectFile<E> &file,
@@ -126,8 +86,35 @@ read_relocations(Context<E> &ctx, ObjectFile<E> &file,
   vec.reserve(hdr.nreloc);
 
   MachRel *rels = (MachRel *)(file.mf->data + hdr.reloff);
-  for (i64 i = 0; i < hdr.nreloc; i++)
-    vec.push_back(read_reloc(ctx, file, hdr, rels[i]));
+
+  for (i64 i = 0; i < hdr.nreloc; i++) {
+    MachRel &r = rels[i];
+    i64 addend = read_addend((u8 *)file.mf->data + hdr.offset, r);
+
+    vec.push_back({r.offset, (u8)r.type, (u8)r.p2size});
+    Relocation<E> &rel = vec.back();
+
+    if (i > 0 && rels[i - 1].type == X86_64_RELOC_SUBTRACTOR)
+      rel.is_subtracted = true;
+
+    if (!rel.is_subtracted && rels[i].type != X86_64_RELOC_SUBTRACTOR)
+      rel.is_pcrel = r.is_pcrel;
+
+    if (r.is_extern) {
+      rel.sym = file.syms[r.idx];
+      rel.addend = addend;
+      continue;
+    }
+
+    u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend + 4) : addend;
+    Subsection<E> *target = file.find_subsection(ctx, r.idx - 1, addr);
+    if (!target)
+      Fatal(ctx) << file << ": bad relocation: " << r.offset;
+
+    rel.subsec = target;
+    rel.addend = addr - target->input_addr;
+  }
+
   return vec;
 }
 
@@ -143,6 +130,7 @@ void Subsection<E>::scan_relocations(Context<E> &ctx) {
 
     switch (r.type) {
     case X86_64_RELOC_UNSIGNED:
+    case X86_64_RELOC_SUBTRACTOR:
       if (sym->is_imported) {
         if (r.p2size != 3) {
           Error(ctx) << this->isec << ": " << r << " relocation at offset 0x"
@@ -168,13 +156,16 @@ void Subsection<E>::scan_relocations(Context<E> &ctx) {
 
 template <>
 void Subsection<E>::apply_reloc(Context<E> &ctx, u8 *buf) {
-  for (const Relocation<E> &r : get_rels()) {
+  std::span<Relocation<E>> rels = get_rels();
+
+  for (i64 i = 0; i < rels.size(); i++) {
+    Relocation<E> &r = rels[i];
+    u64 val = r.addend;
+
     if (r.sym && !r.sym->file) {
       Error(ctx) << "undefined symbol: " << isec.file << ": " << *r.sym;
       continue;
     }
-
-    u64 val = r.addend;
 
     switch (r.type) {
     case X86_64_RELOC_UNSIGNED:
@@ -185,6 +176,15 @@ void Subsection<E>::apply_reloc(Context<E> &ctx, u8 *buf) {
     case X86_64_RELOC_SIGNED_4:
       val += r.sym ? r.sym->get_addr(ctx) : r.subsec->get_addr(ctx);
       break;
+    case X86_64_RELOC_SUBTRACTOR: {
+      Relocation<E> s = rels[++i];
+      assert(s.type == X86_64_RELOC_UNSIGNED);
+      assert(r.p2size == s.p2size);
+      u64 val1 = r.sym ? r.sym->get_addr(ctx) : r.subsec->get_addr(ctx);
+      u64 val2 = s.sym ? s.sym->get_addr(ctx) : s.subsec->get_addr(ctx);
+      val += val2 - val1;
+      break;
+    }
     case X86_64_RELOC_GOT:
     case X86_64_RELOC_GOT_LOAD:
       val += r.sym->get_got_addr(ctx);
@@ -196,13 +196,13 @@ void Subsection<E>::apply_reloc(Context<E> &ctx, u8 *buf) {
       Fatal(ctx) << isec << ": unknown reloc: " << (int)r.type;
     }
 
-    // An address of a thread-local variable is computed as an offset
-    // to the beginning of the first thread-local section.
-    if (isec.hdr.type == S_THREAD_LOCAL_VARIABLES)
+    if (isec.hdr.type == S_THREAD_LOCAL_VARIABLES) {
+      // An address of a thread-local variable is computed as an offset
+      // to the beginning of the first thread-local section.
       val -= ctx.tls_begin;
-
-    if (r.is_pcrel)
+    } else if (r.is_pcrel) {
       val -= get_addr(ctx) + r.offset + 4 + get_reloc_addend(r.type);
+    }
 
     if (r.p2size == 2)
       *(ul32 *)(buf + r.offset) = val;

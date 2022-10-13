@@ -1,17 +1,12 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
+
+# On PPC64V1, function pointers refer function descriptors in .opd
+# instead of directly referring .text section. We create a .opd entry
+# for each symbol. So function pointer comparison on two different
+# symbols are always the same, even if their function body are at the
+# same location.
+[ $MACHINE = ppc64 ] && skip
 
 cat <<EOF | $CC -c -o $t/a.o -ffunction-sections -fdata-sections -xc -
 #include <stdio.h>
@@ -41,5 +36,3 @@ EOF
 
 $CC -B. -o $t/exe $t/a.o -Wl,-icf=all
 $QEMU $t/exe | grep -q '1 0'
-
-echo OK

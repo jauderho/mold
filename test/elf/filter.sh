@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -o $t/a.o -c -x assembler -
   .text
@@ -23,7 +11,5 @@ EOF
 ./mold -o $t/b.so $t/a.o --filter foo -F bar -shared
 
 readelf --dynamic $t/b.so > $t/log
-fgrep -q 'Filter library: [foo]' $t/log
-fgrep -q 'Filter library: [bar]' $t/log
-
-echo OK
+grep -Fq 'Filter library: [foo]' $t/log
+grep -Fq 'Filter library: [bar]' $t/log

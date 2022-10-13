@@ -11,7 +11,8 @@ static u64 page(u64 val) {
   return val & 0xffff'ffff'ffff'f000;
 }
 
-static u64 encode_page(u64 val) {
+static u64 page_offset(u64 hi, u64 lo) {
+  u64 val = page(hi) - page(lo);
   return (bits(val, 13, 12) << 29) | (bits(val, 32, 14) << 5);
 }
 
@@ -20,7 +21,7 @@ void StubsSection<E>::copy_buf(Context<E> &ctx) {
   ul32 *buf = (ul32 *)(ctx.buf + this->hdr.offset);
 
   for (i64 i = 0; i < syms.size(); i++) {
-    static const u32 insn[] = {
+    static const ul32 insn[] = {
       0x90000010, // adrp x16, $ptr@PAGE
       0xf9400210, // ldr  x16, [x16, $ptr@PAGEOFF]
       0xd61f0200, // br   x16
@@ -28,11 +29,11 @@ void StubsSection<E>::copy_buf(Context<E> &ctx) {
 
     static_assert(sizeof(insn) == E::stub_size);
 
-    u64 la_addr = ctx.lazy_symbol_ptr.hdr.addr + E::word_size * i;
+    u64 la_addr = ctx.lazy_symbol_ptr.hdr.addr + word_size * i;
     u64 this_addr = this->hdr.addr + E::stub_size * i;
 
     memcpy(buf, insn, sizeof(insn));
-    buf[0] |= encode_page(page(la_addr) - page(this_addr));
+    buf[0] |= page_offset(la_addr, this_addr);
     buf[1] |= bits(la_addr, 11, 3) << 10;
     buf += 3;
   }
@@ -43,7 +44,7 @@ void StubHelperSection<E>::copy_buf(Context<E> &ctx) {
   ul32 *start = (ul32 *)(ctx.buf + this->hdr.offset);
   ul32 *buf = start;
 
-  static const u32 insn0[] = {
+  static const ul32 insn0[] = {
     0x90000011, // adrp x17, $__dyld_private@PAGE
     0x91000231, // add  x17, x17, $__dyld_private@PAGEOFF
     0xa9bf47f0, // stp	x16, x17, [sp, #-16]!
@@ -56,17 +57,17 @@ void StubHelperSection<E>::copy_buf(Context<E> &ctx) {
   memcpy(buf, insn0, sizeof(insn0));
 
   u64 dyld_private = get_symbol(ctx, "__dyld_private")->get_addr(ctx);
-  buf[0] |= encode_page(page(dyld_private) - page(this->hdr.addr));
+  buf[0] |= page_offset(dyld_private, this->hdr.addr);
   buf[1] |= bits(dyld_private, 11, 0) << 10;
 
   u64 stub_binder = get_symbol(ctx, "dyld_stub_binder")->get_got_addr(ctx);
-  buf[3] |= encode_page(page(stub_binder) - page(this->hdr.addr - 12));
+  buf[3] |= page_offset(stub_binder, this->hdr.addr - 12);
   buf[4] |= bits(stub_binder, 11, 0) << 10;
 
   buf += 6;
 
   for (i64 i = 0; i < ctx.stubs.syms.size(); i++) {
-    static const u32 insn[] = {
+    static const ul32 insn[] = {
       0x18000050, // ldr  w16, addr
       0x14000000, // b    stubHelperHeader
       0x00000000, // addr: .long <idx>
@@ -81,59 +82,62 @@ void StubHelperSection<E>::copy_buf(Context<E> &ctx) {
   }
 }
 
-static Relocation<E>
-read_reloc(Context<E> &ctx, ObjectFile<E> &file,
-           const MachSection &hdr, MachRel *rels, i64 &idx) {
-  i64 addend = 0;
-
-  switch (rels[idx].type) {
-  case ARM64_RELOC_UNSIGNED:
-  case ARM64_RELOC_SUBTRACTOR:
-    switch (MachRel &r = rels[idx]; r.p2size) {
-    case 2:
-      addend = *(il32 *)((u8 *)file.mf->data + hdr.offset + r.offset);
-      break;
-    case 3:
-      addend = *(il64 *)((u8 *)file.mf->data + hdr.offset + r.offset);
-      break;
-    default:
-      unreachable();
-    }
-    break;
-  case ARM64_RELOC_ADDEND:
-    addend = rels[idx++].idx;
-    break;
-  }
-
-  MachRel &r = rels[idx];
-  Relocation<E> rel{r.offset, (u8)r.type, (u8)r.p2size, (bool)r.is_pcrel};
-
-  if (r.is_extern) {
-    rel.sym = file.syms[r.idx];
-    rel.addend = addend;
-    return rel;
-  }
-
-  u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend) : addend;
-  Subsection<E> *target = file.find_subsection(ctx, addr);
-  if (!target)
-    Fatal(ctx) << file << ": bad relocation: " << r.offset;
-
-  rel.subsec = target;
-  rel.addend = addr - target->input_addr;
-  return rel;
-}
-
 template <>
 std::vector<Relocation<E>>
-read_relocations(Context<E> &ctx, ObjectFile<E> &file,
-                 const MachSection &hdr) {
+read_relocations(Context<E> &ctx, ObjectFile<E> &file, const MachSection &hdr) {
   std::vector<Relocation<E>> vec;
   vec.reserve(hdr.nreloc);
 
   MachRel *rels = (MachRel *)(file.mf->data + hdr.reloff);
-  for (i64 i = 0; i < hdr.nreloc; i++)
-    vec.push_back(read_reloc(ctx, file, hdr, rels, i));
+
+  for (i64 i = 0; i < hdr.nreloc; i++) {
+    i64 addend = 0;
+
+    switch (rels[i].type) {
+    case ARM64_RELOC_UNSIGNED:
+    case ARM64_RELOC_SUBTRACTOR:
+      switch (rels[i].p2size) {
+      case 2:
+        addend = *(il32 *)((u8 *)file.mf->data + hdr.offset + rels[i].offset);
+        break;
+      case 3:
+        addend = *(il64 *)((u8 *)file.mf->data + hdr.offset + rels[i].offset);
+        break;
+      default:
+        unreachable();
+      }
+      break;
+    case ARM64_RELOC_ADDEND:
+      addend = rels[i++].idx;
+      break;
+    }
+
+    MachRel &r = rels[i];
+    vec.push_back({r.offset, (u8)r.type, (u8)r.p2size});
+
+    Relocation<E> &rel = vec.back();
+
+    if (i > 0 && rels[i - 1].type == ARM64_RELOC_SUBTRACTOR)
+      rel.is_subtracted = true;
+
+    if (!rel.is_subtracted && rels[i].type != ARM64_RELOC_SUBTRACTOR)
+      rel.is_pcrel = r.is_pcrel;
+
+    if (r.is_extern) {
+      rel.sym = file.syms[r.idx];
+      rel.addend = addend;
+      continue;
+    }
+
+    u64 addr = r.is_pcrel ? (hdr.addr + r.offset + addend) : addend;
+    Subsection<E> *target = file.find_subsection(ctx, r.idx - 1, addr);
+    if (!target)
+      Fatal(ctx) << file << ": bad relocation: " << r.offset;
+
+    rel.subsec = target;
+    rel.addend = addr - target->input_addr;
+  }
+
   return vec;
 }
 
@@ -257,7 +261,7 @@ void Subsection<E>::apply_reloc(Context<E> &ctx, u8 *buf) {
     case ARM64_RELOC_GOT_LOAD_PAGE21:
     case ARM64_RELOC_TLVP_LOAD_PAGE21:
       assert(r.is_pcrel);
-      *(ul32 *)loc |= encode_page(page(val) - page(pc));
+      *(ul32 *)loc |= page_offset(val, pc);
       break;
     case ARM64_RELOC_PAGEOFF12:
     case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
@@ -303,10 +307,9 @@ static bool is_reachable(Context<E> &ctx, Symbol<E> &sym,
 
   // Compute a distance between the relocated place and the symbol
   // and check if they are within reach.
-  i64 S = sym.get_addr(ctx);
-  i64 A = rel.addend;
-  i64 P = subsec.get_addr(ctx) + rel.offset;
-  i64 val = S + A - P;
+  i64 addr = sym.get_addr(ctx);
+  i64 pc = subsec.get_addr(ctx) + rel.offset;
+  i64 val = addr + rel.addend - pc;
   return -(1 << 27) <= val && val < (1 << 27);
 }
 
@@ -444,7 +447,7 @@ void create_range_extension_thunks(Context<E> &ctx, OutputSection<E> &osec) {
 void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   u8 *buf = ctx.buf + output_section.hdr.offset + offset;
 
-  static const u32 data[] = {
+  static const ul32 data[] = {
     0x90000010, // adrp x16, 0   # R_AARCH64_ADR_PREL_PG_HI21
     0x91000210, // add  x16, x16 # R_AARCH64_ADD_ABS_LO12_NC
     0xd61f0200, // br   x16
@@ -453,14 +456,254 @@ void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
   static_assert(ENTRY_SIZE == sizeof(data));
 
   for (i64 i = 0; i < symbols.size(); i++) {
-    u64 S = symbols[i]->get_addr(ctx);
-    u64 P = output_section.hdr.addr + offset + i * ENTRY_SIZE;
+    u64 addr = symbols[i]->get_addr(ctx);
+    u64 pc = output_section.hdr.addr + offset + i * ENTRY_SIZE;
 
     u8 *loc = buf + i * ENTRY_SIZE;
     memcpy(loc , data, sizeof(data));
-    *(ul32 *)loc |= encode_page(page(S) - page(P));
-    *(ul32 *)(loc + 4) |= bits(S, 11, 0) << 10;
+    *(ul32 *)loc |= page_offset(addr, pc);
+    *(ul32 *)(loc + 4) |= bits(addr, 11, 0) << 10;
   }
+}
+
+#define ASSERT_RANGE(val, start, size)                          \
+  assert((start) <= (val) && (val) < ((start) + (size)))
+
+// Rewrite
+//   ldr Xb/Wb, [Xa, #imm]
+// with
+//   ldr Xb/Wb, [#base_addr + #imm]
+// if we can.
+static bool relax_ldr(ul32 *loc, u64 loc_addr, u64 base_addr) {
+  switch (*loc & 0xffc0'0000) {
+  case 0xf940'0000: { // ldr Xb, [Xa, #imm]
+    u64 imm = bits(*loc, 21, 10) * 8;
+    i64 disp = base_addr + imm - loc_addr;
+    if (disp == sign_extend(disp, 20) && (disp & 0b11) == 0) {
+      // ldr Xc, [#base_addr + #imm]
+      *loc = 0x5800'0000 | (bits(disp, 20, 2) << 5) | bits(*loc, 4, 0);
+      return true;
+    }
+    return false;
+  }
+  case 0xb940'0000: { // ldr Wb, [Xa, #imm]
+    u64 imm = bits(*loc, 21, 10) * 4;
+    i64 disp = base_addr + imm - loc_addr;
+    if (disp == sign_extend(disp, 20) && (disp & 0b11) == 0) {
+      // ldr Wc, [#base_addr + #imm]
+      *loc = 0x1800'0000 | (bits(disp, 20, 2) << 5) | bits(*loc, 4, 0);
+      return true;
+    }
+    return false;
+  }
+  }
+  return false;
+}
+
+static bool is_adrp(ul32 *loc) {
+  return (*loc & 0x9f00'0000) == 0x9000'0000;
+}
+
+static u64 get_adrp_imm(ul32 *loc) {
+  return (bits(*loc, 23, 5) << 14) + (bits(*loc, 30, 29) << 12);
+}
+
+template <typename E>
+static void relax_adrp_ldr_got_ldr(Context<E> &ctx,
+                                   ul32 *loc1, ul32 *loc2, ul32 *loc3,
+                                   u64 addr1, u64 addr2, u64 addr3,
+                                   ObjectFile<E> *file) {
+  // We expect the following instructions for a GOT-indirect load:
+  //
+  //   adrp Xa, _foo@GOTPAGE
+  //   ldr  Xb, [Xa, _foo@GOTPAGEOFF]
+  //   ldr/ldrb/ldrsb/ldrsh/... Xc/Wc, [Xb, #imm]
+  if (!is_adrp(loc1) || (*loc2 & 0xffc0'0000) != 0xf940'0000)
+    return;
+
+  u64 got_page = page(addr1) + get_adrp_imm(loc1);
+  u64 pageoff = bits(*loc2, 21, 10) << 3;
+
+  if (got_page + pageoff < ctx.got.hdr.addr ||
+      ctx.got.hdr.addr + ctx.got.hdr.size <= got_page + pageoff)
+    Fatal(ctx) << *file << ": LDR_GOT_LDR out of range";
+
+  ASSERT_RANGE(got_page + pageoff, ctx.got.hdr.addr, ctx.got.hdr.size);
+
+  u64 got_value = *(ul64 *)(ctx.buf + ctx.got.hdr.offset + got_page + pageoff -
+                            ctx.got.hdr.addr);
+
+  // If the GOT slot is already filled with a value and we can
+  // inline the value, do it.
+  if (got_value && relax_ldr(loc3, addr3, got_value)) {
+    *loc1 = 0xd503'201f; // nop
+    *loc2 = 0xd503'201f; // nop
+    return;
+  }
+
+  // If the GOT slot is close enough to PC, we can eliminate ADRP.
+  if (relax_ldr(loc2, addr2, got_page))
+    *loc1 = 0xd503'201f; // nop
+}
+
+static void relax_adrp_adrp(Context<E> &ctx, ul32 *loc1, ul32 *loc2,
+                            u64 addr1, u64 addr2) {
+  //   adrp Xa, _foo@PAGE
+  //   adrp Xa, _bar@PAGE
+  // ->
+  //   ldr  Xa, _foo@PAGE
+  //   nop
+
+  if (is_adrp(loc1) && is_adrp(loc2) &&
+      page(addr1) + get_adrp_imm(loc1) == page(addr2) + get_adrp_imm(loc2) &&
+      bits(*loc1, 4, 0) == bits(*loc2, 4, 0))
+    *loc2 = 0xd503'201f; // nop
+}
+
+static void relax_adrp_ldr(Context<E> &ctx, ul32 *loc1, ul32 *loc2,
+                           u64 addr1, u64 addr2) {
+  //   adrp Xa, _foo@PAGE
+  //   ldr  Xb/Wb, [Xa, _foo@PAGEOFF]
+  // ->
+  //   nop
+  //   ldr  Xb/Wb, [_foo]
+  if (is_adrp(loc1) && relax_ldr(loc2, addr2, page(addr1) + get_adrp_imm(loc1)))
+    *loc1 = 0xd503'201f; // nop
+}
+
+static void relax_adrp_add(Context<E> &ctx, ul32 *loc1, ul32 *loc2,
+                           u64 addr1, u64 addr2) {
+  //   adrp Xa, _foo@PAGE
+  //   add  Xb, Xa, _foo@PAGEOFF
+  // ->
+  //   nop
+  //   adr  Xb, _foo
+  if (!is_adrp(loc1) || (*loc2 & 0xffc0'0000) != 0x9100'0000)
+    return;
+
+  i64 disp = page(addr1) + get_adrp_imm(loc1) + bits(*loc2, 21, 10) - addr2;
+
+  if (disp == sign_extend(disp, 20)) {
+    *loc1 = 0xd503'201f;                                  // nop
+    *loc2 = 0x1000'0000 | (bits(disp, 1, 0) << 29) |
+            (bits(disp, 20, 2) << 5) | bits(*loc2, 4, 0); // adr Xb, _foo
+  }
+}
+
+static Subsection<E> *find_subsection_by_addr(ObjectFile<E> *file, u32 addr) {
+  for (Subsection<E> *subsec : file->subsections)
+    if (subsec->input_addr <= addr &&
+        addr < subsec->input_addr + subsec->input_size)
+      return subsec;
+  return nullptr;
+}
+
+// On ARM, we generally need two or more instructions to materialize
+// an address of an object in a register or jump to a function.
+// However, if an object or a function is close enough to PC, a single
+// instruction suffices.
+//
+// This function replaces such redundant instruction sequences with
+// shorter instruction sequences. We pad holes with NOPs, so the total
+// number of instructions won't change by this relaxation, but replacing
+// instructions with NOPs generally makes program faster since the CPU
+// has a special logic to skip NOPs as quickly as possible.
+//
+// Locations of relaxable instructions are in the
+// LC_LINKER_OPTIMIZATION_HINT segment. That segment contains a
+// sequence of ULEB-encoded integers.
+//
+// This pass is optional; an output file works correctly without
+// applying these optimizations.
+void apply_linker_optimization_hints(Context<E> &ctx) {
+  Timer t(ctx, "apply_linker_optimization_hints");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    std::string_view hints = file->get_linker_optimization_hints(ctx);
+
+    while (!hints.empty()) {
+      i64 type = read_uleb(hints);
+      if (type == 0)
+        return;
+
+      i64 nargs = read_uleb(hints);
+
+      switch (type) {
+      case LOH_ARM64_ADRP_LDR_GOT_LDR: {
+        assert(nargs == 3);
+        i64 input_addr1 = read_uleb(hints);
+        i64 input_addr2 = read_uleb(hints);
+        i64 input_addr3 = read_uleb(hints);
+
+        Subsection<E> *subsec = find_subsection_by_addr(file, input_addr1);
+        if (!subsec || !subsec->is_alive)
+          return;
+
+        ASSERT_RANGE(input_addr1, subsec->input_addr, subsec->input_size);
+        ASSERT_RANGE(input_addr2, subsec->input_addr, subsec->input_size);
+        ASSERT_RANGE(input_addr3, subsec->input_addr, subsec->input_size);
+
+        i64 offset1 = subsec->input_addr - input_addr1;
+        i64 offset2 = subsec->input_addr - input_addr2;
+        i64 offset3 = subsec->input_addr - input_addr3;
+
+        u8 *loc = ctx.buf + subsec->isec.osec.hdr.offset + subsec->output_offset;
+        ul32 *loc1 = (ul32 *)(loc + offset1);
+        ul32 *loc2 = (ul32 *)(loc + offset2);
+        ul32 *loc3 = (ul32 *)(loc + offset3);
+
+        u64 addr1 = subsec->get_addr(ctx) + offset1;
+        u64 addr2 = subsec->get_addr(ctx) + offset2;
+        u64 addr3 = subsec->get_addr(ctx) + offset3;
+
+        relax_adrp_ldr_got_ldr(ctx, loc1, loc2, loc3, addr1, addr2, addr3,
+                               file);
+        break;
+      }
+      case LOH_ARM64_ADRP_ADRP:
+      case LOH_ARM64_ADRP_LDR:
+      case LOH_ARM64_ADRP_ADD: {
+        assert(nargs == 2);
+        i64 input_addr1 = read_uleb(hints);
+        i64 input_addr2 = read_uleb(hints);
+
+        Subsection<E> *subsec = find_subsection_by_addr(file, input_addr1);
+        if (!subsec || !subsec->is_alive)
+          return;
+
+        ASSERT_RANGE(input_addr1, subsec->input_addr, subsec->input_size);
+        ASSERT_RANGE(input_addr2, subsec->input_addr, subsec->input_size);
+
+        i64 offset1 = subsec->input_addr - input_addr1;
+        i64 offset2 = subsec->input_addr - input_addr2;
+
+        u8 *loc = ctx.buf + subsec->isec.osec.hdr.offset + subsec->output_offset;
+        ul32 *loc1 = (ul32 *)(loc + offset1);
+        ul32 *loc2 = (ul32 *)(loc + offset2);
+
+        u64 addr1 = subsec->get_addr(ctx) + offset1;
+        u64 addr2 = subsec->get_addr(ctx) + offset2;
+
+        switch (type) {
+        case LOH_ARM64_ADRP_ADRP:
+          relax_adrp_adrp(ctx, loc1, loc2, addr1, addr2);
+          break;
+        case LOH_ARM64_ADRP_LDR:
+          relax_adrp_ldr(ctx, loc1, loc2, addr1, addr2);
+          break;
+        case LOH_ARM64_ADRP_ADD:
+          relax_adrp_add(ctx, loc1, loc2, addr1, addr2);
+          break;
+        }
+        break;
+      }
+      default:
+        // Skip unsupported optimizations hints.
+        for (i64 i = 0; i < nargs; i++)
+          read_uleb(hints);
+      }
+    }
+  });
 }
 
 } // namespace mold::macho

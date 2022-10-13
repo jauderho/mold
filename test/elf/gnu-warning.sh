@@ -1,33 +1,20 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $GCC -c -o $t/a.o -xc -
-void foo() {}
+#include <stdio.h>
 
 __attribute__((section(".gnu.warning.foo")))
-static const char foo_warning[] = "warning message";
-EOF
+static const char foo[] = "foo is deprecated";
 
-cat <<EOF | $CC -c -o $t/b.o -xc -
-void foo();
+__attribute__((section(".gnu.warning.bar")))
+const char bar[] = "bar is deprecated";
 
-int main() { foo(); }
+int main() {
+  printf("Hello world\n");
+}
 EOF
 
 # Make sure that we do not copy .gnu.warning.* sections.
-$CC -B. -o $t/exe $t/a.o $t/b.o
-! readelf --sections $t/exe | fgrep -q .gnu.warning || false
-
-echo OK
+$CC -B. -o $t/exe $t/a.o
+$QEMU $t/exe | grep -q 'Hello world'

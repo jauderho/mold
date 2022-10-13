@@ -1,19 +1,7 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
-[ $MACHINE = riscv64 ] && { echo skipped; exit; }
+[ $MACHINE = riscv64 -o $MACHINE = riscv32 ] && skip
 
 cat <<EOF | $CC -o $t/a.o -c -x assembler -Wa,-L -
   .text
@@ -28,26 +16,24 @@ EOF
 
 ./mold -o $t/exe $t/a.o
 readelf --symbols $t/exe > $t/log
-fgrep -q _start $t/log
-fgrep -q foo $t/log
-fgrep -q .Lbar $t/log
+grep -Fq _start $t/log
+grep -Fq foo $t/log
+grep -Fq .Lbar $t/log
 
 ./mold -o $t/exe $t/a.o --discard-locals
 readelf --symbols $t/exe > $t/log
-fgrep -q _start $t/log
-fgrep -q foo $t/log
-! fgrep -q .Lbar $t/log || false
+grep -Fq _start $t/log
+grep -Fq foo $t/log
+! grep -Fq .Lbar $t/log || false
 
 ./mold -o $t/exe $t/a.o --discard-all
 readelf --symbols $t/exe > $t/log
-fgrep -q _start $t/log
-! fgrep -q foo $t/log || false
-! fgrep -q .Lbar $t/log || false
+grep -Fq _start $t/log
+! grep -Fq foo $t/log || false
+! grep -Fq .Lbar $t/log || false
 
 ./mold -o $t/exe $t/a.o --strip-all
 readelf --symbols $t/exe > $t/log
-! fgrep -q _start $t/log || false
-! fgrep -q foo $t/log || false
-! fgrep -q .Lbar $t/log || false
-
-echo OK
+! grep -Fq _start $t/log || false
+! grep -Fq foo $t/log || false
+! grep -Fq .Lbar $t/log || false

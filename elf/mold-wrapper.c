@@ -1,6 +1,8 @@
 #define _GNU_SOURCE 1
 
-#include <alloca.h>
+#if !defined(__OpenBSD__) && !defined(__FreeBSD__)
+#  include <alloca.h>
+#endif
 #include <dlfcn.h>
 #include <spawn.h>
 #include <stdarg.h>

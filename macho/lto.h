@@ -62,9 +62,9 @@ struct LTOPlugin {
   void *dlopen_handle = nullptr;
   ~LTOPlugin();
 
-  const char (*get_version)();
+  char (*get_version)();
 
-  const char (*get_error_message)();
+  char (*get_error_message)();
 
   bool (*module_is_object_file)(const char *path);
 
@@ -98,7 +98,7 @@ struct LTOPlugin {
 
   LTOModule *(*module_create_from_fd_at_offset)(int fd, const char *path,
                                                size_t file_size,
-                                               size_t map_size, off_t offset);
+                                               size_t map_size, uint64_t offset);
 
   void (*module_dispose)(LTOModule *mod);
 

@@ -10,20 +10,24 @@
 //
 // ARM processors runs in either ARM mode or Thumb mode. The mode can
 // be switched using BX (branch and mode exchange)-family instructions.
-// We need to use such instructions to, for example, call a function
+// We need to use that instructions to, for example, call a function
 // encoded in Thumb from a function encoded in ARM. Sometimes, the
-// linker even has to emit an interworking thunk code to switch from
-// Thumb to ARM.
+// linker even has to emit an interworking thunk code to switch mode.
 //
 // ARM instructions are aligned to 4 byte boundaries. Thumb are to 2
 // byte boundaries.
 //
 // You can distinguish Thumb functions from ARM functions by looking
 // at the least significant bit (LSB) of its "address". If LSB is 0,
-// it's ARM; otherwise, Thumb. LSB is not a part of its real address.
+// it's ARM; otherwise, Thumb.
+//
 // For example, if a symbol `foo` is of type STT_FUNC and has value
-// 0x2001, then `foo` is a function using Thumb instructions whose
-// address is 0x2000 (not 0x2001).
+// 0x2001, `foo` is a function using Thumb instructions whose address
+// is 0x2000 (not 0x2001, as Thumb instructions are always 2-byte
+// aligned). Likewise, if a function pointer has value 0x2001, it
+// refers a Thumb function at 0x2000.
+//
+// https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst
 
 #include "mold.h"
 
@@ -51,9 +55,9 @@ static void write_thm_b_imm(u8 *loc, u32 val) {
   u32 imm10 = bits(val, 21, 12);
   u32 imm11 = bits(val, 11, 1);
 
-  *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | (sign << 10) | imm10;
-  *(ul16 *)(loc + 2) =
-    (*(ul16 *)(loc + 2) & 0xd000) | (J1 << 13) | (J2 << 11) | imm11;
+  ul16 *buf = (ul16 *)loc;
+  buf[0] = (buf[0] & 0b1111'1000'0000'0000) | (sign << 10) | imm10;
+  buf[1] = (buf[1] & 0b1101'0000'0000'0000) | (J1 << 13) | (J2 << 11) | imm11;
 }
 
 static void write_thm_mov_imm(u8 *loc, u32 val) {
@@ -62,59 +66,46 @@ static void write_thm_mov_imm(u8 *loc, u32 val) {
   u32 i = bit(val, 11);
   u32 imm3 = bits(val, 10, 8);
   u32 imm8 = bits(val, 7, 0);
-  *(ul16 *)loc = (*(ul16 *)loc & 0b1111'1011'1111'0000) | (i << 10) | imm4;
-  *(ul16 *)(loc + 2) =
-    ((*(ul16 *)(loc + 2)) & 0b1000'1111'0000'0000) | (imm3 << 12) | imm8;
+
+  ul16 *buf = (ul16 *)loc;
+  buf[0] = (buf[0] & 0b1111'1011'1111'0000) | (i << 10) | imm4;
+  buf[1] = (buf[1] & 0b1000'1111'0000'0000) | (imm3 << 12) | imm8;
 }
 
 template <>
-void PltSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-
-  static const u32 plt0[] = {
-    0xe52de004, // push {lr}
-    0xe59fe004, // ldr lr, 2f
-    0xe08fe00e, // 1: add lr, pc, lr
-    0xe5bef008, // ldr pc, [lr, #8]!
-    0x00000000, // 2: .word .got.plt - 1b - 8
-    0xe320f000, // nop
-    0xe320f000, // nop
-    0xe320f000, // nop
+void write_plt_header(Context<E> &ctx, u8 *buf) {
+  static const ul32 insn[] = {
+    0xe52d'e004, // push {lr}
+    0xe59f'e004, // ldr lr, 2f
+    0xe08f'e00e, // 1: add lr, pc, lr
+    0xe5be'f008, // ldr pc, [lr, #8]!
+    0x0000'0000, // 2: .word .got.plt - 1b - 8
+    0xe320'f000, // nop
+    0xe320'f000, // nop
+    0xe320'f000, // nop
   };
 
-  memcpy(buf, plt0, sizeof(plt0));
-  *(ul32 *)(buf + 16) = ctx.gotplt->shdr.sh_addr - this->shdr.sh_addr - 16;
+  memcpy(buf, insn, sizeof(insn));
+  *(ul32 *)(buf + 16) = ctx.gotplt->shdr.sh_addr - ctx.plt->shdr.sh_addr - 16;
+}
 
-  for (Symbol<E> *sym : symbols) {
-    static const u32 plt[] = {
-      0xe59fc004, // 1: ldr ip, 2f
-      0xe08cc00f, // add ip, ip, pc
-      0xe59cf000, // ldr pc, [ip]
-      0x00000000, // 2: .word sym@PLTGOT - 1b
-    };
+static const ul32 plt_entry[] = {
+  0xe59f'c004, // 1: ldr ip, 2f
+  0xe08c'c00f, // add ip, ip, pc
+  0xe59c'f000, // ldr pc, [ip]
+  0x0000'0000, // 2: .word sym@GOT - 1b
+};
 
-    u8 *ent = buf + sizeof(plt0) + sym->get_plt_idx(ctx) * sizeof(plt);
-    memcpy(ent, plt, sizeof(plt));
-    *(ul32 *)(ent + 12) = sym->get_gotplt_addr(ctx) - sym->get_plt_addr(ctx) - 12;
-  }
+template <>
+void write_plt_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  memcpy(buf, plt_entry, sizeof(plt_entry));
+  *(ul32 *)(buf + 12) = sym.get_gotplt_addr(ctx) - sym.get_plt_addr(ctx) - 12;
 }
 
 template <>
-void PltGotSection<E>::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-
-  for (Symbol<E> *sym : symbols) {
-    static const u32 plt[] = {
-      0xe59fc004, // 1: ldr ip, 2f
-      0xe08cc00f, // add ip, ip, pc
-      0xe59cf000, // ldr pc, [ip]
-      0x00000000, // 2: .word sym@GOT - 1b
-    };
-
-    u8 *ent = buf + sym->get_pltgot_idx(ctx) * sizeof(plt);
-    memcpy(ent, plt, sizeof(plt));
-    *(ul32 *)(ent + 12) = sym->get_got_addr(ctx) - sym->get_plt_addr(ctx) - 12;
-  }
+void write_pltgot_entry(Context<E> &ctx, u8 *buf, Symbol<E> &sym) {
+  memcpy(buf, plt_entry, sizeof(plt_entry));
+  *(ul32 *)(buf + 12) = sym.get_got_addr(ctx) - sym.get_plt_addr(ctx) - 12;
 }
 
 // ARM does not use .eh_frame for exception handling. Instead, it uses
@@ -123,173 +114,248 @@ template <>
 void EhFrameSection<E>::apply_reloc(Context<E> &ctx, const ElfRel<E> &rel,
                                     u64 offset, u64 val) {}
 
+// ARM and Thumb branch instructions can jump within ±16 MiB.
+static bool is_jump_reachable(i64 val) {
+  return sign_extend(val, 24) == val;
+}
+
 template <>
 void InputSection<E>::apply_reloc_alloc(Context<E> &ctx, u8 *base) {
-  ElfRel<E> *dynrel = nullptr;
   std::span<const ElfRel<E>> rels = get_rels(ctx);
 
-  i64 frag_idx = 0;
-
+  ElfRel<E> *dynrel = nullptr;
   if (ctx.reldyn)
     dynrel = (ElfRel<E> *)(ctx.buf + ctx.reldyn->shdr.sh_offset +
                            file.reldyn_offset + this->reldyn_offset);
 
+  i64 trampoline_idx = 0;
+
+  auto get_trampoline_addr = [&](u64 addr) {
+    for (; trampoline_idx < output_section->thunks.size(); trampoline_idx++) {
+      RangeExtensionThunk<E> &thunk = *output_section->thunks[trampoline_idx];
+      i64 disp = output_section->shdr.sh_addr + thunk.offset - addr;
+      if (is_jump_reachable(disp))
+        return disp;
+    }
+    unreachable();
+  };
+
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_ARM_NONE)
+    if (rel.r_type == R_NONE || rel.r_type == R_ARM_V4BX)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
     u8 *loc = base + rel.r_offset;
 
-    const SectionFragmentRef<E> *frag_ref = nullptr;
-    if (rel_fragments && rel_fragments[frag_idx].idx == i)
-      frag_ref = &rel_fragments[frag_idx++];
-
-#define S   (frag_ref ? frag_ref->frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A   (frag_ref ? frag_ref->addend : this->get_addend(rel))
-#define P   (output_section->shdr.sh_addr + offset + rel.r_offset)
+#define S   sym.get_addr(ctx)
+#define A   this->get_addend(rel)
+#define P   (get_addr() + rel.r_offset)
 #define T   (sym.get_addr(ctx) & 1)
-#define G   (sym.get_got_addr(ctx) - ctx.got->shdr.sh_addr)
+#define G   (sym.get_got_idx(ctx) * sizeof(Word<E>))
 #define GOT ctx.got->shdr.sh_addr
+
+    auto get_thumb_thunk_addr = [&] {
+      RangeExtensionRef ref = extra.range_extn[i];
+      assert(ref.thunk_idx != -1);
+      u64 addr = output_section->thunks[ref.thunk_idx]->get_addr(ref.sym_idx);
+      assert(is_jump_reachable(addr + A - P));
+      return addr;
+    };
+
+    auto get_arm_thunk_addr = [&] {
+      return get_thumb_thunk_addr() + 4;
+    };
 
     switch (rel.r_type) {
     case R_ARM_ABS32:
     case R_ARM_TARGET1:
-      if (sym.is_absolute() || !ctx.arg.pic) {
-        *(ul32 *)loc = S + A;
-      } else if (sym.is_imported) {
-        *dynrel++ = {P, R_ARM_ABS32, (u32)sym.get_dynsym_idx(ctx)};
-      } else {
-        if (!is_relr_reloc(ctx, rel))
-          *dynrel++ = {P, R_ARM_RELATIVE, 0};
-        *(ul32 *)loc = S + A;
-      }
-      continue;
+      apply_dyn_absrel(ctx, sym, rel, loc, S, A, P, dynrel);
+      break;
     case R_ARM_REL32:
       *(ul32 *)loc = S + A - P;
-      continue;
-    case R_ARM_THM_CALL:
+      break;
+    case R_ARM_THM_CALL: {
       // THM_CALL relocation refers either BL or BLX instruction.
       // They are different in only one bit. We need to use BL if
       // the jump target is Thumb. Otherwise, use BLX.
-      if (sym.esym().is_undef_weak()) {
+      if (sym.is_remaining_undef_weak()) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
-        write_thm_b_imm(loc, 4);
-        *(ul16 *)(loc + 2) |= (1 << 12); // rewrite with BL
-      } else if (T) {
-        write_thm_b_imm(loc, S + A - P);
-        *(ul16 *)(loc + 2) |= (1 << 12); // rewrite with BL
-      } else {
-        write_thm_b_imm(loc, align_to(S + A - P, 4));
-        *(ul16 *)(loc + 2) &= ~(1 << 12); // rewrite with BLX
+        *(ul32 *)loc = 0x8000'f3af; // NOP.W
+        break;
       }
-      continue;
+
+      i64 val = S + A - P;
+      if (is_jump_reachable(val)) {
+        if (T) {
+          write_thm_b_imm(loc, val);
+          *(ul16 *)(loc + 2) |= 0x1000;  // rewrite to BL
+        } else {
+          write_thm_b_imm(loc, align_to(val, 4));
+          *(ul16 *)(loc + 2) &= ~0x1000; // rewrite to BLX
+        }
+      } else {
+        write_thm_b_imm(loc, align_to(get_arm_thunk_addr() + A - P, 4));
+        *(ul16 *)(loc + 2) &= ~0x1000;  // rewrite to BLX
+      }
+      break;
+    }
     case R_ARM_BASE_PREL:
       *(ul32 *)loc = GOT + A - P;
-      continue;
+      break;
     case R_ARM_GOT_PREL:
-      *(ul32 *)loc = G + A - P;
-      continue;
-    case R_ARM_GOT_BREL:
-      *(ul32 *)loc = G + A;
-      continue;
     case R_ARM_TARGET2:
       *(ul32 *)loc = GOT + G + A - P;
-      continue;
-    case R_ARM_CALL:
-    case R_ARM_JUMP24: {
-      u32 val;
+      break;
+    case R_ARM_GOT_BREL:
+      *(ul32 *)loc = G + A;
+      break;
+    case R_ARM_CALL: {
+      // Just like THM_CALL, ARM_CALL relocation refers either BL or
+      // BLX instruction. We may need to rewrite BL → BLX or BLX → BL.
+      bool is_bl = ((*(ul32 *)loc & 0xff00'0000) == 0xeb00'0000);
+      bool is_blx = ((*(ul32 *)loc & 0xfe00'0000) == 0xfa00'0000);
+      if (!is_bl && !is_blx)
+        Fatal(ctx) << *this << ": R_ARM_CALL refers neither BL nor BLX";
 
-      if (sym.esym().is_undef_weak()) {
+      if (sym.is_remaining_undef_weak()) {
         // On ARM, calling an weak undefined symbol jumps to the
         // next instruction.
-        val = 4;
-      } else {
-        val = S + A - P;
+        *(ul32 *)loc = 0xe320'f000; // NOP
+        break;
       }
 
-      *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | ((val >> 2) & 0x00ff'ffff);
-      continue;
+      u64 val = S + A - P;
+      if (is_jump_reachable(val)) {
+        if (T)
+          *(ul32 *)loc = 0xfa00'0000 | (bit(val, 1) << 24) | bits(val, 25, 2);
+        else
+          *(ul32 *)loc = 0xeb00'0000 | bits(val, 25, 2);
+      } else {
+        *(ul32 *)loc = 0xeb00'0000 | bits(get_arm_thunk_addr() + A - P, 25, 2);
+      }
+      break;
     }
-    case R_ARM_THM_JUMP11: {
+    case R_ARM_JUMP24:
+      if (sym.is_remaining_undef_weak()) {
+        *(ul32 *)loc = 0xe320'f000; // NOP
+      } else {
+        // Unlike BL and BLX, we can't rewrite B to BX because BX doesn't
+        // takes an immediate; it takes only a register. So if mode switch
+        // is required, we jump to a linker-synthesized thunk which constructs
+        // a branch destination in a register and branches to that address.
+        u64 val = S + A - P;
+        if (!is_jump_reachable(val) || T)
+          val = get_arm_thunk_addr() + A - P;
+        *(ul32 *)loc = (*(ul32 *)loc & 0xff00'0000) | bits(val, 25, 2);
+      }
+      break;
+    case R_ARM_THM_JUMP11:
       assert(T);
-      u32 val = (S + A - P) >> 1;
-      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | (val & 0x07ff);
-      continue;
+      *(ul16 *)loc = (*(ul16 *)loc & 0xf800) | bits(S + A - P, 11, 1);
+      break;
+    case R_ARM_THM_JUMP19: {
+      i64 val = S + A - P;
+
+      // sign:J2:J1:imm6:imm11:'0'
+      u32 sign = bit(val, 20);
+      u32 J2 = bit(val, 19);
+      u32 J1 = bit(val, 18);
+      u32 imm6 = bits(val, 17, 12);
+      u32 imm11 = bits(val, 11, 1);
+
+      *(ul16 *)loc &= 0b1111'1011'1100'0000;
+      *(ul16 *)loc |= (sign << 10) | imm6;
+
+      *(ul16 *)(loc + 2) &= 0b1101'0000'0000'0000;
+      *(ul16 *)(loc + 2) |= (J2 << 13) | (J1 << 11) | imm11;
+      break;
     }
     case R_ARM_THM_JUMP24:
-      if (T) {
-        write_thm_b_imm(loc, S + A - P);
+      if (sym.is_remaining_undef_weak()) {
+        *(ul32 *)loc = 0x8000'f3af; // NOP.W
       } else {
-        assert(sym.extra.thumb_to_arm_thunk_idx != -1);
-        u64 thunk_addr =
-          ctx.thumb_to_arm->shdr.sh_addr +
-          sym.extra.thumb_to_arm_thunk_idx * ThumbToArmSection::ENTRY_SIZE;
-        write_thm_b_imm(loc, thunk_addr - P - 4);
+        // Just like R_ARM_JUMP24, we need to jump to a thunk if we need to
+        // switch processor mode.
+        u64 val = S + A - P;
+        if (!is_jump_reachable(val) || !T)
+          val = get_thumb_thunk_addr() + A - P;
+        write_thm_b_imm(loc, val);
       }
-      continue;
+      break;
     case R_ARM_MOVW_PREL_NC:
       write_mov_imm(loc, ((S + A) | T) - P);
-      continue;
+      break;
     case R_ARM_MOVW_ABS_NC:
       write_mov_imm(loc, (S + A) | T);
-      continue;
+      break;
     case R_ARM_THM_MOVW_PREL_NC:
       write_thm_mov_imm(loc, ((S + A) | T) - P);
-      continue;
-    case R_ARM_PREL31: {
-      u32 val = S + A - P;
-      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | (val & 0x7fff'ffff);
-      continue;
-    }
+      break;
+    case R_ARM_PREL31:
+      *(ul32 *)loc = (*(ul32 *)loc & 0x8000'0000) | ((S + A - P) & 0x7fff'ffff);
+      break;
     case R_ARM_THM_MOVW_ABS_NC:
       write_thm_mov_imm(loc, (S + A) | T);
-      continue;
+      break;
     case R_ARM_MOVT_PREL:
       write_mov_imm(loc, (S + A - P) >> 16);
-      continue;
+      break;
     case R_ARM_THM_MOVT_PREL:
       write_thm_mov_imm(loc, (S + A - P) >> 16);
-      continue;
+      break;
     case R_ARM_MOVT_ABS:
       write_mov_imm(loc, (S + A) >> 16);
-      continue;
+      break;
     case R_ARM_THM_MOVT_ABS:
       write_thm_mov_imm(loc, (S + A) >> 16);
-      continue;
+      break;
     case R_ARM_TLS_GD32:
       *(ul32 *)loc = sym.get_tlsgd_addr(ctx) + A - P;
-      continue;
+      break;
     case R_ARM_TLS_LDM32:
       *(ul32 *)loc = ctx.got->get_tlsld_addr(ctx) + A - P;
-      continue;
+      break;
     case R_ARM_TLS_LDO32:
       *(ul32 *)loc = S + A - ctx.tls_begin;
-      continue;
+      break;
     case R_ARM_TLS_IE32:
       *(ul32 *)loc = sym.get_gottp_addr(ctx) + A - P;
-      continue;
+      break;
     case R_ARM_TLS_LE32:
-      *(ul32 *)loc = S + A - ctx.tls_begin + 8;
-      continue;
+      *(ul32 *)loc = S + A - ctx.tp_addr;
+      break;
     case R_ARM_TLS_GOTDESC:
-      if (sym.get_tlsdesc_idx(ctx) == -1)
-        *(ul32 *)loc = S - ctx.tls_begin + 8;
-      else
-        *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) + A - P - 6;
-      continue;
-    case R_ARM_THM_TLS_CALL:
-      if (sym.get_tlsdesc_idx(ctx) == -1) {
-        // BL -> NOP
-        *(ul32 *)loc = 0x8000f3af;
+      if (sym.has_tlsdesc(ctx)) {
+        // A is odd if the corresponding TLS_CALL is Thumb.
+        if (A & 1)
+          *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 6;
+        else
+          *(ul32 *)loc = sym.get_tlsdesc_addr(ctx) - P + A - 4;
       } else {
-        u64 addr = ctx.tls_trampoline->shdr.sh_addr;
-        write_thm_b_imm(loc, align_to(addr - P - 4, 4));
-        *(ul16 *)(loc + 2) &= ~(1 << 12); // rewrite BL with BLX
+        *(ul32 *)loc = S - ctx.tp_addr;
       }
-      continue;
+      break;
+    case R_ARM_TLS_CALL:
+      if (sym.has_tlsdesc(ctx)) {
+        // BL <tls_trampoline>
+        *(ul32 *)loc = 0xeb00'0000 | bits(get_trampoline_addr(P + 8), 25, 2);
+      } else {
+        // BL -> NOP
+        *(ul32 *)loc = 0xe320'f000;
+      }
+      break;
+    case R_ARM_THM_TLS_CALL:
+      if (sym.has_tlsdesc(ctx)) {
+        u64 val = align_to(get_trampoline_addr(P + 4), 4);
+        write_thm_b_imm(loc, val);
+        *(ul16 *)(loc + 2) &= ~0x1000; // rewrite BL with BLX
+      } else {
+        // BL -> NOP.W
+        *(ul32 *)loc = 0x8000'f3af;
+      }
+      break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
     }
@@ -309,7 +375,7 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
 
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_ARM_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -321,24 +387,21 @@ void InputSection<E>::apply_reloc_nonalloc(Context<E> &ctx, u8 *base) {
     }
 
     SectionFragment<E> *frag;
-    i64 addend;
-    std::tie(frag, addend) = get_fragment(ctx, rel);
+    i64 frag_addend;
+    std::tie(frag, frag_addend) = get_fragment(ctx, rel);
 
 #define S (frag ? frag->get_addr(ctx) : sym.get_addr(ctx))
-#define A (frag ? addend : this->get_addend(rel))
+#define A (frag ? frag_addend : this->get_addend(rel))
 
     switch (rel.r_type) {
     case R_ARM_ABS32:
-      if (!frag) {
-        if (std::optional<u64> val = get_tombstone(sym)) {
-          *(ul32 *)loc = *val;
-          break;
-        }
-      }
-      *(ul32 *)loc = S + A;
+      if (std::optional<u64> val = get_tombstone(sym, frag))
+        *(ul32 *)loc = *val;
+      else
+        *(ul32 *)loc = S + A;
       break;
     case R_ARM_TLS_LDO32:
-      if (std::optional<u64> val = get_tombstone(sym))
+      if (std::optional<u64> val = get_tombstone(sym, frag))
         *(ul32 *)loc = *val;
       else
         *(ul32 *)loc = S + A - ctx.tls_begin;
@@ -364,7 +427,7 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   // Scan relocations
   for (i64 i = 0; i < rels.size(); i++) {
     const ElfRel<E> &rel = rels[i];
-    if (rel.r_type == R_ARM_NONE)
+    if (rel.r_type == R_NONE)
       continue;
 
     Symbol<E> &sym = *file.symbols[rel.r_sym];
@@ -374,66 +437,33 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       continue;
     }
 
-    if (sym.get_type() == STT_GNU_IFUNC) {
-      sym.flags |= NEEDS_GOT;
-      sym.flags |= NEEDS_PLT;
-    }
+    if (sym.is_ifunc())
+      sym.flags |= (NEEDS_GOT | NEEDS_PLT);
 
     switch (rel.r_type) {
     case R_ARM_ABS32:
     case R_ARM_MOVT_ABS:
     case R_ARM_THM_MOVT_ABS:
-    case R_ARM_TARGET1: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // DSO
-        {  NONE,     BASEREL, DYNREL,        DYNREL },     // PIE
-        {  NONE,     NONE,    COPYREL,       CPLT   },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_ARM_TARGET1:
+      scan_rel(ctx, sym, rel, dyn_absrel_table);
       break;
-    }
-    case R_ARM_REL32:
-    case R_ARM_BASE_PREL:
+    case R_ARM_THM_CALL:
+    case R_ARM_CALL:
+    case R_ARM_JUMP24:
+    case R_ARM_THM_JUMP24:
+      if (sym.is_imported)
+        sym.flags |= NEEDS_PLT;
       break;
-    case R_ARM_THM_CALL: {
-      Action table[][4] = {
-        // Absolute  Local  Imported data  Imported code
-        {  NONE,     NONE,  PLT,           PLT    },     // DSO
-        {  NONE,     NONE,  PLT,           PLT    },     // PIE
-        {  NONE,     NONE,  PLT,           PLT    },     // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
-      break;
-    }
     case R_ARM_GOT_PREL:
     case R_ARM_GOT_BREL:
     case R_ARM_TARGET2:
       sym.flags |= NEEDS_GOT;
       break;
-    case R_ARM_CALL:
-    case R_ARM_JUMP24:
-      if (sym.is_imported)
-        sym.flags |= NEEDS_PLT;
-      break;
-    case R_ARM_THM_JUMP24:
-      if (sym.is_imported || sym.get_type() == STT_GNU_IFUNC)
-        sym.flags |= NEEDS_PLT | NEEDS_THUMB_TO_ARM_THUNK;
-      else if (sym.esym().st_value % 2 == 0)
-        sym.flags |= NEEDS_THUMB_TO_ARM_THUNK;
-      break;
     case R_ARM_MOVT_PREL:
     case R_ARM_THM_MOVT_PREL:
-    case R_ARM_PREL31: {
-      Action table[][4] = {
-        // Absolute  Local    Imported data  Imported code
-        {  ERROR,    NONE,    ERROR,         PLT   },      // DSO
-        {  ERROR,    NONE,    COPYREL,       PLT   },      // PIE
-        {  NONE,     NONE,    COPYREL,       PLT   },      // PDE
-      };
-      dispatch(ctx, table, i, rel, sym);
+    case R_ARM_PREL31:
+      scan_rel(ctx, sym, rel, pcrel_table);
       break;
-    }
     case R_ARM_TLS_GD32:
       sym.flags |= NEEDS_TLSGD;
       break;
@@ -444,17 +474,22 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
       sym.flags |= NEEDS_GOTTP;
       break;
     case R_ARM_TLS_GOTDESC:
-      if (!ctx.relax_tlsdesc || sym.is_imported)
+      if (!relax_tlsdesc(ctx, sym))
         sym.flags |= NEEDS_TLSDESC;
       break;
+    case R_ARM_REL32:
+    case R_ARM_BASE_PREL:
     case R_ARM_THM_JUMP11:
+    case R_ARM_THM_JUMP19:
     case R_ARM_MOVW_PREL_NC:
     case R_ARM_MOVW_ABS_NC:
     case R_ARM_THM_MOVW_PREL_NC:
     case R_ARM_THM_MOVW_ABS_NC:
     case R_ARM_TLS_LDO32:
     case R_ARM_TLS_LE32:
+    case R_ARM_TLS_CALL:
     case R_ARM_THM_TLS_CALL:
+    case R_ARM_V4BX:
       break;
     default:
       Error(ctx) << *this << ": unknown relocation: " << rel;
@@ -462,57 +497,53 @@ void InputSection<E>::scan_relocations(Context<E> &ctx) {
   }
 }
 
-// If a function referenced by a Thumb B (branch) instruction is
-// resovled to a non-thumb function, we can't directly jump from the
-// thumb function to the ARM function. We can't rewrite B with BX
-// because there's no such BX instruction that takes an immediate.
-// BX takes only a register.
-//
-// In order to support such branch, we insert a small piece of code to
-// the resulting executable which switches the processor mode from
-// Thumb to ARM. This section contains such code.
-void ThumbToArmSection::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  if (sym->extra.thumb_to_arm_thunk_idx == -1) {
-    sym->extra.thumb_to_arm_thunk_idx = symbols.size();
-    symbols.push_back(sym);
+template <>
+void RangeExtensionThunk<E>::copy_buf(Context<E> &ctx) {
+  u8 *buf = ctx.buf + output_section.shdr.sh_offset + offset;
+
+  // TLS trampoline code. ARM32's TLSDESC is designed so that this
+  // common piece of code is factored out from object files to reduce
+  // output size. Since no one provide, the linker has to synthesize it.
+  static ul32 hdr[] = {
+    0xe08e'0000, // add r0, lr, r0
+    0xe590'1004, // ldr r1, [r0, #4]
+    0xe12f'ff11, // bx  r1
+  };
+
+  // This is a range extension and mode switch thunk.
+  // It has two entry points: +0 for Thumb and +4 for ARM.
+  const u8 entry[] = {
+    // .thumb
+    0xfc, 0x46,             //    mov  ip, pc
+    0x60, 0x47,             //    bx   ip  # jumps to the following `ldr` insn
+    // .arm
+    0x04, 0xc0, 0x9f, 0xe5, //    ldr  ip, 2f
+    0x0f, 0xc0, 0x8c, 0xe0, // 1: add  ip, ip, pc
+    0x1c, 0xff, 0x2f, 0xe1, //    bx   ip
+    0x00, 0x00, 0x00, 0x00, // 2: .word sym - 1b
+  };
+
+  static_assert(E::thunk_hdr_size == sizeof(hdr));
+  static_assert(E::thunk_size == sizeof(entry));
+
+  memcpy(buf, hdr, sizeof(hdr));
+
+  for (i64 i = 0; i < symbols.size(); i++) {
+    u8 *loc = buf + sizeof(hdr) + i * sizeof(entry);
+    memcpy(loc, entry, sizeof(entry));
+
+    u64 S = symbols[i]->get_addr(ctx);
+    u64 P = output_section.shdr.sh_addr + offset + sizeof(hdr) + i * sizeof(entry);
+    *(ul32 *)(loc + 16) = S - P - 16;
   }
 }
 
-void ThumbToArmSection::update_shdr(Context<E> &ctx) {
-  this->shdr.sh_size = symbols.size() * ENTRY_SIZE;
-}
-
-void ThumbToArmSection::copy_buf(Context<E> &ctx) {
-  u8 *buf = ctx.buf + this->shdr.sh_offset;
-  i64 offset = 0;
-
-  static u8 insn[] = {
-    0x40, 0xf2, 0x00, 0x0c, // movw ip, $0
-    0xc0, 0xf2, 0x00, 0x0c, // movt ip, $0
-    0xfc, 0x44,             // add  ip, pc
-    0x60, 0x47,             // bx   ip
-  };
-
-  static_assert(sizeof(insn) == ENTRY_SIZE);
-
-  for (Symbol<E> *sym : symbols) {
-    memcpy(buf + offset, insn, sizeof(insn));
-
-    u32 val = sym->get_addr(ctx) - this->shdr.sh_addr - offset - 12;
-    write_thm_mov_imm(buf + offset, val);
-    write_thm_mov_imm(buf + offset + 4, val >> 16);
-    offset += sizeof(insn);
-  }
-}
-
-void TlsTrampolineSection::copy_buf(Context<E> &ctx) {
-  // Trampoline code for TLSDESC
-  static u32 insn[] = {
-    0xe08e0000, // add r0, lr, r0
-    0xe5901004, // ldr r1, [r0, #4]
-    0xe12fff11, // bx  r1
-  };
-  memcpy(ctx.buf + this->shdr.sh_offset, insn, sizeof(insn));
+template <typename E>
+static OutputSection<E> *find_exidx_section(Context<E> &ctx) {
+  for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
+    if (osec->shdr.sh_type == SHT_ARM_EXIDX)
+      return osec.get();
+  return nullptr;
 }
 
 // ARM executables use an .ARM.exidx section to look up an exception
@@ -527,14 +558,7 @@ void TlsTrampolineSection::copy_buf(Context<E> &ctx) {
 void sort_arm_exidx(Context<E> &ctx) {
   Timer t(ctx, "sort_arm_exidx");
 
-  auto find_exidx = [&]() -> OutputSection<E> * {
-    for (std::unique_ptr<OutputSection<E>> &osec : ctx.output_sections)
-      if (osec->shdr.sh_type == SHT_ARM_EXIDX)
-        return osec.get();
-    return nullptr;
-  };
-
-  OutputSection<E> *osec = find_exidx();
+  OutputSection<E> *osec = find_exidx_section(ctx);
   if (!osec)
     return;
 
@@ -548,8 +572,10 @@ void sort_arm_exidx(Context<E> &ctx) {
   // 3. a 31-bit relative address which points to a larger record in
   //    the .ARM.extab section.
   //
-  // CANTUNWIND is value 1. The most significant is set in (2) but not
-  // in (3). So they can be distinguished just by looking at a value.
+  // CANTUNWIND is value 1. The most significant bit is set in (2) but
+  // not in (3). So we can distinguished them just by looking at a value.
+  const u32 EXIDX_CANTUNWIND = 1;
+
   struct Entry {
     ul32 addr;
     ul32 val;
@@ -558,38 +584,34 @@ void sort_arm_exidx(Context<E> &ctx) {
   if (osec->shdr.sh_size % sizeof(Entry))
     Fatal(ctx) << "invalid .ARM.exidx section size";
 
-  Entry *begin = (Entry *)(ctx.buf + osec->shdr.sh_offset);
-  Entry *end = (Entry *)(ctx.buf + osec->shdr.sh_offset + osec->shdr.sh_size);
+  Entry *ent = (Entry *)(ctx.buf + osec->shdr.sh_offset);
+  i64 num_entries = osec->shdr.sh_size / sizeof(Entry);
 
-  struct Entry2 {
-    u32 addr;
-    u32 val;
-    u32 idx;
+  // Entry's addresses are relative to themselves. In order to sort
+  // records by addresses, we first translate them so that the addresses
+  // are relative to the beginning of the section.
+  auto is_relative = [](u32 val) {
+    return val != EXIDX_CANTUNWIND && !(val & 0x8000'0000);
   };
 
-  // Read section contents
-  std::vector<Entry2> vec;
-  vec.reserve(end - begin);
-  for (Entry *it = begin; it < end; it++)
-    vec.push_back({it->addr, it->val, (u32)(it - begin)});
-
-  // Sort the records
-  tbb::parallel_sort(vec.begin(), vec.end(), [](const Entry2 &a, const Entry2 &b) {
-    return sign_extend(a.addr, 30) + a.idx * sizeof(Entry) <
-           sign_extend(b.addr, 30) + b.idx * sizeof(Entry);
+  tbb::parallel_for((i64)0, num_entries, [&](i64 i) {
+    i64 offset = sizeof(Entry) * i;
+    ent[i].addr = sign_extend(ent[i].addr, 30) + offset;
+    if (is_relative(ent[i].val))
+      ent[i].val = 0x7fff'ffff & (ent[i].val + offset);
   });
 
-  // Write back the sorted records while adjusting relative addresses
-  for (i64 i = 0; i < vec.size(); i++) {
-    u32 offset = (vec[i].idx - i) * sizeof(Entry);
-    begin[i].addr = 0x7fff'ffff & (sign_extend(vec[i].addr, 30) + offset);
+  tbb::parallel_sort(ent, ent + num_entries, [](const Entry &a, const Entry &b) {
+    return a.addr < b.addr;
+  });
 
-    const u32 EXIDX_CANTUNWIND = 1;
-    if (vec[i].val == EXIDX_CANTUNWIND || (vec[i].val & 0x8000'0000))
-      begin[i].val = vec[i].val;
-    else
-      begin[i].val = 0x7fff'ffff & (sign_extend(vec[i].val, 30) + offset);
-  }
+  // Make addresses relative to themselves.
+  tbb::parallel_for((i64)0, num_entries, [&](i64 i) {
+    i64 offset = sizeof(Entry) * i;
+    ent[i].addr = 0x7fff'ffff & (ent[i].addr - offset);
+    if (is_relative(ent[i].val))
+      ent[i].val = 0x7fff'ffff & (ent[i].val - offset);
+  });
 }
 
 } // namespace mold::elf

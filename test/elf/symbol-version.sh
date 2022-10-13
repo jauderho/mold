@@ -1,17 +1,5 @@
 #!/bin/bash
-export LC_ALL=C
-set -e
-CC="${TEST_CC:-cc}"
-CXX="${TEST_CXX:-c++}"
-GCC="${TEST_GCC:-gcc}"
-GXX="${TEST_GXX:-g++}"
-OBJDUMP="${OBJDUMP:-objdump}"
-MACHINE="${MACHINE:-$(uname -m)}"
-testname=$(basename "$0" .sh)
-echo -n "Testing $testname ... "
-cd "$(dirname "$0")"/../..
-t=out/test/elf/$testname
-mkdir -p $t
+. $(dirname $0)/common.inc
 
 cat <<EOF | $CC -fPIC -c -o $t/a.o -xc -
 void foo1() {}
@@ -33,8 +21,6 @@ echo 'VER1 { local: *; }; VER2 { local: *; }; VER3 { local: *; };' > $t/b.ver
 $CC -B. -shared -o $t/c.so $t/a.o -Wl,--version-script=$t/b.ver
 readelf --symbols $t/c.so > $t/log
 
-fgrep -q 'foo@VER1' $t/log
-fgrep -q 'foo@VER2' $t/log
-fgrep -q 'foo@@VER3' $t/log
-
-echo OK
+grep -Fq 'foo@VER1' $t/log
+grep -Fq 'foo@VER2' $t/log
+grep -Fq 'foo@@VER3' $t/log

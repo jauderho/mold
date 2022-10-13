@@ -1,5 +1,6 @@
+#ifndef _WIN32
+
 #include "mold.h"
-#include "../sha.h"
 
 #include <filesystem>
 #include <signal.h>
@@ -9,8 +10,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __FreeBSD__
+# include <sys/sysctl.h>
+#endif
+
 namespace mold::elf {
 
+#ifdef MOLD_X86_64
 // Exiting from a program with large memory usage is slow --
 // it may take a few hundred milliseconds. To hide the latency,
 // we fork a child and let it do the actual linking work.
@@ -50,10 +56,11 @@ std::function<void()> fork_child() {
 
   return [=] {
     char buf[] = {1};
-    int n = write(pipefd[1], buf, 1);
+    [[maybe_unused]] int n = write(pipefd[1], buf, 1);
     assert(n == 1);
   };
 }
+#endif
 
 template <typename E>
 static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
@@ -79,21 +86,38 @@ static std::string find_dso(Context<E> &ctx, std::filesystem::path self) {
   Fatal(ctx) << "mold-wrapper.so is missing";
 }
 
+static std::string get_self_path() {
+#ifdef __FreeBSD__
+  // /proc may not be mounted on FreeBSD. The proper way to get the
+  // current executable's path is to use sysctl(2).
+  int mib[4];
+  mib[0] = CTL_KERN;
+  mib[1] = KERN_PROC;
+  mib[2] = KERN_PROC_PATHNAME;
+  mib[3] = -1;
+
+  size_t size;
+  sysctl(mib, 4, NULL, &size, NULL, 0);
+
+  std::string path;
+  path.resize(size);
+  sysctl(mib, 4, path.data(), &size, NULL, 0);
+  return path;
+#else
+  return std::filesystem::read_symlink("/proc/self/exe");
+#endif
+}
+
 template <typename E>
 [[noreturn]]
 void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
-#ifdef __APPLE__
-  // LD_PRELOAD is not supported on macOS
-  Fatal(ctx) << "mold -run is not supported on macOS";
-#endif
+  assert(argv[1] == "-run"s || argv[1] == "--run"s);
 
-  std::string_view arg1 = argv[1];
-  assert(arg1 == "-run" || arg1 == "--run");
   if (!argv[2])
     Fatal(ctx) << "-run: argument missing";
 
   // Get the mold-wrapper.so path
-  std::string self = std::filesystem::read_symlink("/proc/self/exe");
+  std::string self = get_self_path();
   std::string dso_path = find_dso(ctx, self);
 
   // Set environment variables
@@ -116,9 +140,10 @@ void process_run_subcommand(Context<E> &ctx, int argc, char **argv) {
   Fatal(ctx) << "mold -run failed: " << argv[2] << ": " << errno_string();
 }
 
-#define INSTANTIATE(E)                                                  \
-  template void process_run_subcommand(Context<E> &, int, char **)
+using E = MOLD_TARGET;
 
-INSTANTIATE_ALL;
+template void process_run_subcommand(Context<E> &, int, char **);
 
 } // namespace mold::elf
+
+#endif

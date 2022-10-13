@@ -1,49 +1,90 @@
-// This file defines integral types for file input/output. You should
-// use these types instead of the plain integers (such as u32 or i32)
-// when reading from/writing to an mmap'ed file area.
+// This file defines integral types for file input/output. We need to use
+// these types instead of the plain integers (such as uint32_t or int32_t)
+// when reading from/writing to an mmap'ed file area for the following
+// reasons:
 //
-// Here is why you need these types. In C/C++, all data accesses must
-// be aligned. That is, if you read an N byte value from memory, the
-// address of that value must be a multiple of N. For example, reading
-// an u32 value from address 16 is legal, while reading from 18 is not
-// (since 18 is not a multiple of 4.) An unaligned access yields an
-// undefined behavior.
+// 1. mold is always a cross linker and should not depend on what host it
+//    is running on. Users should be able to run mold on a big-endian
+//    SPARC machine to create a little-endian RV64 binary, for example.
 //
-// All data members of the ELF data structures are naturally aligned,
-// so it may look like we don't need the integral types defined in
-// this file to access them. But there's a catch; if an object file is
-// in an archive file (a .a file), the beginning of the file is
-// guaranteed to be aligned only to a 2 bytes boundary, because ar
-// aligns each member only to a 2 byte boundary. Therefore, any data
-// members larger than 2 bytes may be unaligned in an mmap'ed memory,
-// and thus you always need to use the integral types in this file to
-// access it.
+// 2. Even though data members in all ELF data strucutres are naturally
+//    aligned, they are not guaranteed to be aligned on memory. Because
+//    archive file (.a file) aligns each member only to a 2 byte boundary,
+//    anything larger than 2 bytes may be unaligned in an mmap'ed memory.
+//    Unaligned access is an undefined behavior in C/C++, so we shouldn't
+//    cast an arbitrary pointer to a uint32_t, for example, to read a
+//    32-bits value.
+//
+// The data types defined in this file don't depend on host byte order and
+// don't do unaligned access.
 
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 
-#ifdef __BIG_ENDIAN__
-#error "mold does not support big-endian hosts"
+#if !defined(__LITTLE_ENDIAN__) && !defined(__BIG_ENDIAN__)
+# if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#  define __LITTLE_ENDIAN__ 1
+# elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#  define __BIG_ENDIAN__ 1
+# else
+#  error "unknown host byte order"
+# endif
 #endif
 
 namespace mold {
 
-template <typename T, size_t SIZE = sizeof(T)>
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+typedef int8_t i8;
+typedef int16_t i16;
+typedef int32_t i32;
+typedef int64_t i64;
+
+template <typename T>
+static inline T bswap(T val) {
+  switch (sizeof(T)) {
+  case 2:  return __builtin_bswap16(val);
+  case 4:  return __builtin_bswap32(val);
+  case 8:  return __builtin_bswap64(val);
+  default: __builtin_unreachable();
+  }
+}
+
+template <typename T, int SIZE = sizeof(T)>
 class LittleEndian {
 public:
-  LittleEndian() { *this = 0; }
+  LittleEndian() = default;
   LittleEndian(T x) { *this = x; }
 
   operator T() const {
-    T x = 0;
-    memcpy(&x, val, SIZE);
+    T x;
+    memcpy(&x, val, sizeof(T));
+    if constexpr (std::endian::native == std::endian::big)
+      x = bswap(x);
     return x;
   }
 
   LittleEndian &operator=(T x) {
-    memcpy(&val, &x, SIZE);
+    if constexpr (std::endian::native == std::endian::big)
+      x = bswap(x);
+    memcpy(val, &x, sizeof(T));
+    return *this;
+  }
+
+  operator T() const requires (SIZE == 3) {
+    return (val[2] << 16) | (val[1] << 8) | val[0];
+  }
+
+  LittleEndian &operator=(T x) requires (SIZE == 3) {
+    val[2] = x >> 16;
+    val[1] = x >> 8;
+    val[0] = x;
     return *this;
   }
 
@@ -84,31 +125,46 @@ public:
   }
 
 private:
-  uint8_t val[SIZE];
+  u8 val[SIZE];
 };
 
-using il16 = LittleEndian<int16_t>;
-using il32 = LittleEndian<int32_t>;
-using il64 = LittleEndian<int64_t>;
-using ul16 = LittleEndian<uint16_t>;
-using ul24 = LittleEndian<uint32_t, 3>;
-using ul32 = LittleEndian<uint32_t>;
-using ul64 = LittleEndian<uint64_t>;
+using il16 = LittleEndian<i16>;
+using il32 = LittleEndian<i32>;
+using il64 = LittleEndian<i64>;
+using ul16 = LittleEndian<u16>;
+using ul24 = LittleEndian<u32, 3>;
+using ul32 = LittleEndian<u32>;
+using ul64 = LittleEndian<u64>;
 
-template <typename T>
+template <typename T, int SIZE = sizeof(T)>
 class BigEndian {
 public:
-  BigEndian() = delete;
+  BigEndian() = default;
+  BigEndian(T x) { *this = x; }
 
   operator T() const {
     T x;
     memcpy(&x, val, sizeof(T));
-    return bswap(x);
+    if constexpr (std::endian::native == std::endian::little)
+      x = bswap(x);
+    return x;
   }
 
   BigEndian &operator=(T x) {
-    x = bswap(x);
-    memcpy(&val, &x, sizeof(T));
+    if constexpr (std::endian::native == std::endian::little)
+      x = bswap(x);
+    memcpy(val, &x, sizeof(T));
+    return *this;
+  }
+
+  operator T() const requires (SIZE == 3) {
+    return (val[0] << 16) | (val[1] << 8) | val[2];
+  }
+
+  BigEndian &operator=(T x) requires (SIZE == 3) {
+    val[0] = x >> 16;
+    val[1] = x >> 8;
+    val[2] = x;
     return *this;
   }
 
@@ -136,6 +192,10 @@ public:
     return *this = *this + x;
   }
 
+  BigEndian &operator-=(T x) {
+    return *this = *this - x;
+  }
+
   BigEndian &operator&=(T x) {
     return *this = *this & x;
   }
@@ -145,23 +205,15 @@ public:
   }
 
 private:
-  uint8_t val[sizeof(T)];
-
-  static T bswap(T x) {
-    if constexpr (sizeof(T) == 2)
-      return __builtin_bswap16(x);
-    else if constexpr (sizeof(T) == 4)
-      return __builtin_bswap32(x);
-    else
-      return __builtin_bswap64(x);
-  }
+  u8 val[SIZE];
 };
 
-using ib16 = BigEndian<int16_t>;
-using ib32 = BigEndian<int32_t>;
-using ib64 = BigEndian<int64_t>;
-using ub16 = BigEndian<uint16_t>;
-using ub32 = BigEndian<uint32_t>;
-using ub64 = BigEndian<uint64_t>;
+using ib16 = BigEndian<i16>;
+using ib32 = BigEndian<i32>;
+using ib64 = BigEndian<i64>;
+using ub16 = BigEndian<u16>;
+using ub24 = BigEndian<u32, 3>;
+using ub32 = BigEndian<u32>;
+using ub64 = BigEndian<u64>;
 
 } // namespace mold
