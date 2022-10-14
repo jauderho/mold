@@ -1522,7 +1522,7 @@ static constexpr u32 R_390_COPY = 9;
 static constexpr u32 R_390_GLOB_DAT = 10;
 static constexpr u32 R_390_JMP_SLOT = 11;
 static constexpr u32 R_390_RELATIVE = 12;
-static constexpr u32 R_390_GOTOFF = 13;
+static constexpr u32 R_390_GOTOFF32 = 13;
 static constexpr u32 R_390_GOTPC = 14;
 static constexpr u32 R_390_GOT16 = 15;
 static constexpr u32 R_390_PC16 = 16;
@@ -1592,7 +1592,7 @@ inline std::string rel_to_string<S390X>(u32 r_type) {
   case R_390_GLOB_DAT: return "R_390_GLOB_DAT";
   case R_390_JMP_SLOT: return "R_390_JMP_SLOT";
   case R_390_RELATIVE: return "R_390_RELATIVE";
-  case R_390_GOTOFF: return "R_390_GOTOFF";
+  case R_390_GOTOFF32: return "R_390_GOTOFF32";
   case R_390_GOTPC: return "R_390_GOTPC";
   case R_390_GOT16: return "R_390_GOT16";
   case R_390_PC16: return "R_390_PC16";
@@ -2669,7 +2669,7 @@ struct PPC64V1 {
   static constexpr u32 e_machine = EM_PPC64;
   static constexpr u32 plt_hdr_size = 52;
   static constexpr u32 plt_size = 8;
-  static constexpr u32 pltgot_size = 4;
+  static constexpr u32 pltgot_size = 0;
   static constexpr u32 tls_dtv_offset = 0x8000;
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 28;
@@ -2706,7 +2706,7 @@ struct PPC64V2 {
   static constexpr u32 e_machine = EM_PPC64;
   static constexpr u32 plt_hdr_size = 60;
   static constexpr u32 plt_size = 4;
-  static constexpr u32 pltgot_size = 4;
+  static constexpr u32 pltgot_size = 0;
   static constexpr u32 tls_dtv_offset = 0x8000;
   static constexpr u32 thunk_hdr_size = 0;
   static constexpr u32 thunk_size = 20;
