@@ -126,7 +126,7 @@ jobs:
         cmake --build . -j$(nproc)
         ctest . -j$(nproc)
     - name: archive test results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: test-results
